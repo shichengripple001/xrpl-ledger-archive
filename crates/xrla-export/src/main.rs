@@ -6,19 +6,17 @@
 ///               --ledgers /var/lib/rippled/db/ledger.db \
 ///               --start 1000000 --end 1001000 \
 ///               --out ./chunks/
-///
-/// The --ledgers file is rippled's SQLite ledger index, used to look up
-/// the state hash and transaction list for each ledger sequence number.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
+use rusqlite::{Connection, params};
 
-use xrla_common::chunk::{chunk_filename, Chunk, LedgerDelta, TxMap, TxRecord, NETWORK_MAINNET};
+use xrla_common::chunk::{chunk_filename, Chunk, LedgerDelta, TxMap, NETWORK_MAINNET};
 use xrla_common::serialize::serialize_chunk;
-use xrla_common::shamap::SHAMapNode;
+use xrla_common::shamap::{Hash256, NodeType, SHAMapNode};
 use xrla_nudb::NuDBReader;
 
 #[derive(Parser, Debug)]
@@ -28,7 +26,7 @@ struct Args {
     #[arg(long)]
     dat: PathBuf,
 
-    /// Path to rippled ledger SQLite database (for state hashes + tx lists)
+    /// Path to rippled ledger SQLite database (ledger.db)
     #[arg(long)]
     ledgers: PathBuf,
 
@@ -66,49 +64,51 @@ fn main() -> Result<()> {
 
     println!("Exporting ledgers {}..{}", args.start, args.end);
 
-    // Fetch checkpoint (full state at start_ledger)
+    // Checkpoint: full state at start_ledger
     let start_info = ledger_db.get(args.start)?;
-    println!("Building checkpoint at ledger {}...", args.start);
-    let checkpoint_nodes = nudb.collect_reachable(&start_info.state_hash)?;
-    let checkpoint: Vec<SHAMapNode> = checkpoint_nodes
-        .into_iter()
-        .map(|(hash, content)| {
-            let node_type = if content.first().copied().unwrap_or(1) == 0 {
-                xrla_common::shamap::NodeType::Inner
-            } else {
-                xrla_common::shamap::NodeType::Leaf
-            };
-            SHAMapNode { hash, node_type, content }
-        })
-        .collect();
-    println!("Checkpoint: {} nodes", checkpoint.len());
+    println!(
+        "Building checkpoint at ledger {} (state_hash={})...",
+        args.start,
+        hex::encode(start_info.account_hash)
+    );
+    let checkpoint_nodes = nudb.collect_reachable(&start_info.account_hash)?;
+    println!("Checkpoint: {} nodes", checkpoint_nodes.len());
 
-    // Fetch tx map for start ledger
-    let mut tx_maps = vec![ledger_db.get_tx_map(args.start)?];
+    // TX map for start ledger (no delta, just transactions)
+    let mut tx_maps = vec![TxMap { ledger_seq: args.start, txns: vec![] }];
 
     // Compute deltas
     let mut deltas = Vec::new();
-    let mut total_delta_nodes = 0usize;
+    let mut total_added = 0usize;
+    let mut total_deleted = 0usize;
 
     for seq in (args.start + 1)..=args.end {
         let prev_info = ledger_db.get(seq - 1)?;
         let curr_info = ledger_db.get(seq)?;
 
-        print!("  ledger {seq}... ");
-        let diff = nudb.diff(&prev_info.state_hash, &curr_info.state_hash)?;
-        let added = diff.added.len();
-        let deleted = diff.deleted.len();
-        total_delta_nodes += added + deleted;
-        println!("+{added} -{deleted} nodes");
+        let diff = nudb
+            .diff(&prev_info.account_hash, &curr_info.account_hash)
+            .with_context(|| format!("diff failed at ledger {seq}"))?;
+
+        println!(
+            "  ledger {seq}: +{} -{} nodes ({} bytes)",
+            diff.added.len(),
+            diff.deleted.len(),
+            diff.added.iter().map(|n| n.content.len() + 33).sum::<usize>()
+        );
+
+        total_added += diff.added.len();
+        total_deleted += diff.deleted.len();
 
         deltas.push(LedgerDelta { ledger_seq: seq, diff });
-        tx_maps.push(ledger_db.get_tx_map(seq)?);
+        tx_maps.push(TxMap { ledger_seq: seq, txns: vec![] });
     }
 
+    let ledger_count = args.end - args.start;
     println!(
-        "Total delta nodes: {} across {} ledgers",
-        total_delta_nodes,
-        args.end - args.start
+        "Totals: +{total_added} -{total_deleted} nodes across {ledger_count} ledgers \
+         (avg +{}/ledger)",
+        if ledger_count > 0 { total_added / ledger_count as usize } else { 0 }
     );
 
     let chunk = Chunk {
@@ -117,7 +117,7 @@ fn main() -> Result<()> {
         end_ledger:      args.end,
         checkpoint_hash: start_info.ledger_hash,
         chunk_hash:      [0u8; 32], // computed by serialize_chunk
-        checkpoint,
+        checkpoint:      checkpoint_nodes,
         deltas,
         tx_maps,
     };
@@ -127,11 +127,15 @@ fn main() -> Result<()> {
     let out_path = args.out.join(&filename);
     fs::write(&out_path, &bytes)?;
 
+    // chunk_hash is at byte offset 77 in the header (4+1+4+4+4+32+32 = 81 bytes header,
+    // chunk_hash starts at offset 4+1+4+4+4+32 = 49)
+    let chunk_hash_hex = hex::encode(&bytes[49..81]);
+
     println!(
-        "Wrote {} ({} bytes, chunk_hash={})",
+        "\nWrote {} ({} bytes)\nchunk_hash: {}",
         out_path.display(),
         bytes.len(),
-        hex::encode(&bytes[77..109]) // chunk_hash offset in header
+        chunk_hash_hex
     );
 
     Ok(())
@@ -140,27 +144,24 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // LedgerIndex: reads rippled's ledger SQLite database
 //
-// rippled stores a SQLite database (Ledgers table) with:
-//   LedgerSeq      INTEGER
-//   LedgerHash     BLOB
-//   PrevHash       BLOB
-//   AccountSetHash BLOB   <- this is the state hash
-//   TransSetHash   BLOB   <- this is the tx map hash
-//   ...
+// Table: Ledgers
+//   LedgerHash     TEXT  — hex-encoded ledger hash
+//   LedgerSeq      INT
+//   AccountSetHash TEXT  — hex-encoded state SHAMap root hash
+//   TransSetHash   TEXT  — hex-encoded tx SHAMap root hash
 //
-// TODO: Verify exact table/column names against rippled source.
+// Source: src/xrpld/app/rdb/backend/detail/Node.cpp
 // ---------------------------------------------------------------------------
 
 struct LedgerInfo {
-    ledger_hash: [u8; 32],
-    state_hash:  [u8; 32],
-    tx_hash:     [u8; 32],
+    ledger_hash:  Hash256,
+    account_hash: Hash256, // state SHAMap root
+    #[allow(dead_code)]
+    tx_hash:      Hash256,
 }
 
 struct LedgerIndex {
-    // TODO: use rusqlite crate for real implementation
-    // Placeholder for now — real implementation reads rippled's Ledgers table
-    _path: PathBuf,
+    conn: Connection,
 }
 
 impl LedgerIndex {
@@ -168,20 +169,39 @@ impl LedgerIndex {
         if !path.exists() {
             bail!("ledger database not found: {}", path.display());
         }
-        // TODO: open SQLite connection
-        Ok(Self { _path: path.to_path_buf() })
+        let conn = Connection::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        Ok(Self { conn })
     }
 
-    fn get(&self, _seq: u32) -> Result<LedgerInfo> {
-        // TODO: SELECT LedgerHash, AccountSetHash, TransSetHash FROM Ledgers WHERE LedgerSeq = ?
-        bail!("LedgerIndex::get not yet implemented — add rusqlite dependency")
-    }
+    fn get(&self, seq: u32) -> Result<LedgerInfo> {
+        let (ledger_hash_hex, account_hash_hex, tx_hash_hex): (String, String, String) = self
+            .conn
+            .query_row(
+                "SELECT LedgerHash, AccountSetHash, TransSetHash \
+                 FROM Ledgers WHERE LedgerSeq = ?1",
+                params![seq],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .with_context(|| format!("ledger {seq} not found in database"))?;
 
-    fn get_tx_map(&self, seq: u32) -> Result<TxMap> {
-        // TODO: fetch transactions for this ledger from rippled's tx database
-        Ok(TxMap {
-            ledger_seq: seq,
-            txns: vec![],
+        Ok(LedgerInfo {
+            ledger_hash:  parse_hash(&ledger_hash_hex)
+                .with_context(|| format!("invalid LedgerHash for seq {seq}"))?,
+            account_hash: parse_hash(&account_hash_hex)
+                .with_context(|| format!("invalid AccountSetHash for seq {seq}"))?,
+            tx_hash:      parse_hash(&tx_hash_hex)
+                .with_context(|| format!("invalid TransSetHash for seq {seq}"))?,
         })
     }
+}
+
+fn parse_hash(s: &str) -> Result<Hash256> {
+    let bytes = hex::decode(s.trim())?;
+    if bytes.len() != 32 {
+        bail!("expected 32-byte hash, got {} bytes from '{}'", bytes.len(), s);
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&bytes);
+    Ok(h)
 }

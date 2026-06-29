@@ -11,5 +11,6 @@ path = "src/main.rs"
 anyhow      = { workspace = true }
 clap        = { workspace = true }
 hex         = { workspace = true }
+rusqlite    = { version = "0.31", features = ["bundled"] }
 xrla-common = { path = "../xrla-common" }
 xrla-nudb   = { path = "../xrla-nudb" }

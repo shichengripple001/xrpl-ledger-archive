@@ -50,7 +50,7 @@ fn write_bytes(w: &mut impl Write, b: &[u8]) -> Result<()> {
 
 fn write_node(w: &mut impl Write, node: &SHAMapNode) -> Result<()> {
     write_bytes(w, &node.hash)?;
-    write_u8(w, node.node_type.clone() as u8)?;
+    write_u8(w, u8::from(&node.node_type))?;
     write_u16be(w, node.content.len() as u16)?;
     write_bytes(w, &node.content)?;
     Ok(())
@@ -244,7 +244,7 @@ fn read_node(r: &mut impl Read) -> Result<SHAMapNode, ChunkError> {
     let hash      = read_hash(r)?;
     let type_byte = read_u8(r)?;
     let node_type = NodeType::try_from(type_byte)
-        .map_err(|_| ChunkError::InvalidMagic)?;
+        .map_err(|_| ChunkError::UnsupportedVersion(type_byte))?;
     let len     = read_u16be(r)? as usize;
     let content = read_exact(r, len)?;
     Ok(SHAMapNode { hash, node_type, content })
