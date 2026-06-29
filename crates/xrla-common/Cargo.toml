@@ -1,0 +1,11 @@
+[package]
+name    = "xrla-common"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow    = { workspace = true }
+hex       = { workspace = true }
+serde     = { workspace = true }
+sha2      = { workspace = true }
+thiserror = { workspace = true }
