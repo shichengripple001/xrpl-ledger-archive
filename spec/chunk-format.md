@@ -1,0 +1,185 @@
+# XRPL Ledger Archive — Chunk Format Specification
+
+Version: 1  
+Status: DRAFT
+
+---
+
+## Overview
+
+An `.xrla` file (XRP Ledger Archive chunk) contains a contiguous range of ledger history
+encoded as:
+- One **checkpoint**: full SHAMap state at the first ledger in the range
+- N **deltas**: one per subsequent ledger, containing only the nodes that changed
+- N+1 **transaction maps**: transactions and metadata for every ledger in the range
+
+All multi-byte integers are big-endian.
+All node lists within a section are sorted ascending by node hash.
+
+---
+
+## File Layout
+
+```
+[HEADER]       fixed size, 85 bytes
+[CHECKPOINT]   variable
+[DELTAS]       variable, one entry per ledger from start+1 to end
+[TX_MAPS]      variable, one entry per ledger from start to end
+[FOOTER]       fixed size, 4 bytes
+```
+
+---
+
+## Header
+
+| Field            | Type      | Size | Description                                      |
+|------------------|-----------|------|--------------------------------------------------|
+| magic            | bytes     | 4    | 0x58524C41 ("XRLA")                              |
+| version          | uint8     | 1    | Format version = 1                               |
+| network_id       | uint32    | 4    | 1 = mainnet, 2 = testnet, 3 = devnet             |
+| start_ledger     | uint32    | 4    | First ledger sequence in this chunk              |
+| end_ledger       | uint32    | 4    | Last ledger sequence in this chunk               |
+| checkpoint_hash  | bytes     | 32   | Ledger hash at start_ledger (from ledger header) |
+| chunk_hash       | bytes     | 32   | SHA-512/half of all bytes after this field       |
+
+Total: 81 bytes
+
+The `chunk_hash` covers: CHECKPOINT + DELTAS + TX_MAPS + FOOTER.
+It does NOT cover the header itself (the header contains the hash).
+
+---
+
+## Checkpoint
+
+Full SHAMap state at `start_ledger`. Contains every node in the state trie.
+
+| Field       | Type   | Size     | Description                    |
+|-------------|--------|----------|--------------------------------|
+| node_count  | uint32 | 4        | Number of nodes                |
+| nodes[]     | —      | variable | Node records, sorted by hash   |
+
+### Node Record
+
+| Field   | Type   | Size     | Description                              |
+|---------|--------|----------|------------------------------------------|
+| hash    | bytes  | 32       | SHA-512/half of node content             |
+| type    | uint8  | 1        | 0 = inner node, 1 = leaf node            |
+| length  | uint16 | 2        | Byte length of content field             |
+| content | bytes  | `length` | Raw serialized node content              |
+
+Nodes are sorted ascending by `hash` (lexicographic byte order).
+
+---
+
+## Deltas
+
+One delta entry per ledger from `start_ledger + 1` through `end_ledger`.
+Entries appear in ascending ledger sequence order.
+
+### Delta Entry
+
+| Field         | Type   | Size     | Description                                   |
+|---------------|--------|----------|-----------------------------------------------|
+| ledger_seq    | uint32 | 4        | Ledger sequence this delta applies to         |
+| added_count   | uint32 | 4        | Number of added or modified nodes             |
+| added[]       | —      | variable | Node records (same format as checkpoint)      |
+| deleted_count | uint32 | 4        | Number of deleted nodes                       |
+| deleted[]     | —      | variable | Deleted node hashes                           |
+
+### Deleted Node Record
+
+| Field | Type  | Size | Description          |
+|-------|-------|------|----------------------|
+| hash  | bytes | 32   | Hash of deleted node |
+
+Added nodes are sorted ascending by hash.
+Deleted nodes are sorted ascending by hash.
+
+---
+
+## Transaction Maps
+
+One entry per ledger from `start_ledger` through `end_ledger`.
+Entries appear in ascending ledger sequence order.
+
+### TX Map Entry
+
+| Field      | Type   | Size     | Description                            |
+|------------|--------|----------|----------------------------------------|
+| ledger_seq | uint32 | 4        | Ledger sequence                        |
+| tx_count   | uint16 | 2        | Number of transactions                 |
+| txs[]      | —      | variable | Transaction records                    |
+
+### Transaction Record
+
+| Field     | Type   | Size      | Description                      |
+|-----------|--------|-----------|----------------------------------|
+| tx_hash   | bytes  | 32        | Transaction hash                 |
+| tx_len    | uint32 | 4         | Byte length of tx_blob           |
+| tx_blob   | bytes  | `tx_len`  | Raw serialized transaction       |
+| meta_len  | uint32 | 4         | Byte length of meta_blob         |
+| meta_blob | bytes  | `meta_len`| Raw serialized transaction meta  |
+
+Transactions within a ledger are sorted ascending by tx_hash.
+
+---
+
+## Footer
+
+| Field     | Type  | Size | Description              |
+|-----------|-------|------|--------------------------|
+| end_magic | bytes | 4    | 0x454E4458 ("ENDX")      |
+
+---
+
+## Verification Algorithm
+
+To verify a chunk file:
+
+1. Read header, check magic = "XRLA", version = 1
+2. Compute SHA-512/half of bytes from after chunk_hash field to end of file
+3. Assert computed hash == header.chunk_hash
+4. Load checkpoint nodes into an in-memory SHAMap, compute root hash
+5. Assert root hash == header.checkpoint_hash
+   (checkpoint_hash is the ledger hash at start_ledger — fetch from network to verify)
+6. For each delta (ledger seq start+1 to end):
+   a. Apply added nodes to SHAMap
+   b. Remove deleted nodes from SHAMap
+   c. Compute new root hash
+   d. Assert root hash == ledger header hash for this ledger seq
+      (fetch ledger header from network, or from TX_MAPS section)
+7. If all assertions pass — chunk is valid
+
+---
+
+## Chunk Naming Convention
+
+```
+xrla_<network_id>_<start_ledger>_<end_ledger>.xrla
+
+Examples:
+  xrla_1_80000000_80100000.xrla   (mainnet, 100k ledgers)
+  xrla_1_00000001_00100000.xrla   (mainnet, genesis chunk)
+```
+
+---
+
+## Manifest File
+
+A `manifest.json` at the root of a distribution lists all available chunks:
+
+```json
+{
+  "network_id": 1,
+  "updated_at": "2026-01-25T00:00:00Z",
+  "chunks": [
+    {
+      "start_ledger": 1,
+      "end_ledger": 100000,
+      "chunk_hash": "abc123...",
+      "size_bytes": 18000000000,
+      "url": "https://s3.amazonaws.com/xrpl-archive/xrla_1_00000001_00100000.xrla"
+    }
+  ]
+}
+```
