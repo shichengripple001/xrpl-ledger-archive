@@ -15,6 +15,7 @@
 ///                    (TODO: implement for production)
 
 pub mod dat;
+pub mod keyfile;
 pub mod reader;
 
 pub use reader::NuDBReader;

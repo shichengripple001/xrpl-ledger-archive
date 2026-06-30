@@ -99,6 +99,12 @@ Deleted nodes are sorted ascending by hash.
 
 ## Transaction Maps
 
+> **Status: populated and verified.** The exporter fills TX_MAPS from the transaction SHAMap
+> (`TransSetHash` tree) read directly from NuDB. Verified end-to-end: every `tx_hash` equals
+> `SHA512half(HashPrefix::transactionID + tx_blob)`, and each ledger's reconstructed tx-tree
+> root equals the on-chain `TransSetHash`. Each leaf's source content is
+> `['SND\0'][VL(tx_blob)][VL(meta_blob)][32-byte tx_hash]` (rippled `HashPrefix::txNode`).
+
 One entry per ledger from `start_ledger` through `end_ledger`.
 Entries appear in ascending ledger sequence order.
 
@@ -151,6 +157,38 @@ To verify a chunk file:
 7. If all assertions pass — chunk is valid
 
 ---
+
+## Partial Fetch & Stream Separation
+
+A user typically wants one of two things, with very different costs:
+
+| Need | Sections required | Approx size |
+|------|-------------------|-------------|
+| Inspect/query transactions in a range | TX_MAPS only | ~KB/ledger |
+| Reconstruct full state / serve a node | CHECKPOINT + DELTAS | checkpoint is multi-GB |
+
+A single bundled `.xrla` forces a transaction-querier to download the heavy checkpoint they don't
+need. To avoid that, the three sections SHOULD be independently fetchable. Two mechanisms (decide
+in Phase 1):
+
+1. **Sidecar files** per range, each independently content-addressed and verifiable:
+   ```
+   xrla_<net>_<start>_<end>.ckpt    CHECKPOINT   (heavy; only for state reconstruction)
+   xrla_<net>_<start>_<end>.delta   DELTAS       (per-ledger state changes)
+   xrla_<net>_<start>_<end>.tx      TX_MAPS      (cheap; for transaction queries)
+   ```
+2. **Section byte-ranges in the manifest** — keep one `.xrla` but publish per-section offsets so
+   clients can issue HTTP range requests for just the part they need.
+
+Either way, checkpoints SHOULD be sparse (e.g. one per ~1M ledgers), with delta/tx streams
+referencing the nearest preceding checkpoint, so checkpoint bytes are not repeated per chunk.
+
+## Local Query Index (informative)
+
+The query tool builds a local index over downloaded streams (not part of the wire format):
+`tx_hash → (file, offset)`, `account_id → ledgers touched`, `ledger_seq → file`. Transaction
+lookups resolve from `.tx` alone; full-state and balance-at-ledger queries additionally need
+`.ckpt` + `.delta`.
 
 ## Chunk Naming Convention
 

@@ -16,15 +16,16 @@ use rusqlite::{Connection, params};
 
 use xrla_common::chunk::{chunk_filename, Chunk, LedgerDelta, TxMap, NETWORK_MAINNET};
 use xrla_common::serialize::serialize_chunk;
-use xrla_common::shamap::{Hash256, NodeType, SHAMapNode};
+use xrla_common::shamap::Hash256;
 use xrla_nudb::NuDBReader;
 
 #[derive(Parser, Debug)]
 #[command(name = "xrla-export", about = "Export XRPL ledger history to chunk files")]
 struct Args {
-    /// Path to rippled NuDB .dat file
-    #[arg(long)]
-    dat: PathBuf,
+    /// Path to a rippled NuDB .dat file (sibling nudb.key must exist). Repeat for each
+    /// shard — online_delete keeps two databases live and the state spans both.
+    #[arg(long, required = true, num_args = 1..)]
+    dat: Vec<PathBuf>,
 
     /// Path to rippled ledger SQLite database (ledger.db)
     #[arg(long)]
@@ -56,7 +57,6 @@ fn main() -> Result<()> {
 
     fs::create_dir_all(&args.out)?;
 
-    println!("Opening NuDB: {}", args.dat.display());
     let nudb = NuDBReader::open(&args.dat)?;
 
     println!("Opening ledger index: {}", args.ledgers.display());
@@ -75,7 +75,11 @@ fn main() -> Result<()> {
     println!("Checkpoint: {} nodes", checkpoint_nodes.len());
 
     // TX map for start ledger (no delta, just transactions)
-    let mut tx_maps = vec![TxMap { ledger_seq: args.start, txns: vec![] }];
+    let start_txns = nudb
+        .collect_transactions(&start_info.tx_hash)
+        .with_context(|| format!("tx collect failed at ledger {}", args.start))?;
+    let mut total_txns = start_txns.len();
+    let mut tx_maps = vec![TxMap { ledger_seq: args.start, txns: start_txns }];
 
     // Compute deltas
     let mut deltas = Vec::new();
@@ -90,23 +94,29 @@ fn main() -> Result<()> {
             .diff(&prev_info.account_hash, &curr_info.account_hash)
             .with_context(|| format!("diff failed at ledger {seq}"))?;
 
+        let txns = nudb
+            .collect_transactions(&curr_info.tx_hash)
+            .with_context(|| format!("tx collect failed at ledger {seq}"))?;
+
         println!(
-            "  ledger {seq}: +{} -{} nodes ({} bytes)",
+            "  ledger {seq}: +{} -{} nodes ({} bytes), {} txns",
             diff.added.len(),
             diff.deleted.len(),
-            diff.added.iter().map(|n| n.content.len() + 33).sum::<usize>()
+            diff.added.iter().map(|n| n.content.len() + 33).sum::<usize>(),
+            txns.len()
         );
 
         total_added += diff.added.len();
         total_deleted += diff.deleted.len();
+        total_txns += txns.len();
 
         deltas.push(LedgerDelta { ledger_seq: seq, diff });
-        tx_maps.push(TxMap { ledger_seq: seq, txns: vec![] });
+        tx_maps.push(TxMap { ledger_seq: seq, txns });
     }
 
     let ledger_count = args.end - args.start;
     println!(
-        "Totals: +{total_added} -{total_deleted} nodes across {ledger_count} ledgers \
+        "Totals: +{total_added} -{total_deleted} nodes, {total_txns} txns across {ledger_count} ledgers \
          (avg +{}/ledger)",
         if ledger_count > 0 { total_added / ledger_count as usize } else { 0 }
     );
@@ -156,8 +166,7 @@ fn main() -> Result<()> {
 struct LedgerInfo {
     ledger_hash:  Hash256,
     account_hash: Hash256, // state SHAMap root
-    #[allow(dead_code)]
-    tx_hash:      Hash256,
+    tx_hash:      Hash256, // transaction SHAMap root (TransSetHash)
 }
 
 struct LedgerIndex {
