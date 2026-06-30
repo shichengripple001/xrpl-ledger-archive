@@ -133,7 +133,7 @@ fn find_new_root(added: &[SHAMapNode], prev_root: &Hash256) -> Result<Hash256> {
     let mut referenced = std::collections::HashSet::new();
     for node in added {
         if matches!(node.node_type, NodeType::Inner) {
-            if let Ok(inner) = InnerNode::from_bytes(&node.content) {
+            if let Ok(inner) = InnerNode::from_full_bytes(&node.content) {
                 for child_hash in inner.child_hashes() {
                     referenced.insert(*child_hash);
                 }
