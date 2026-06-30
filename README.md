@@ -22,19 +22,9 @@ See [PLAN.md](PLAN.md) for the design, [DESIGN_NOTES.md](DESIGN_NOTES.md) for th
 - **Range-addressed + stream-separable.** Download only the ledger range you need; fetch only the
   streams you need (transactions without the heavy state checkpoint).
 
-## Built on top: query layer
-
-Because chunks preserve full SHAMap state, the same data backs a query layer with no Cassandra:
-
-- **Local tool** — download a range, query transactions / accounts / full state at any ledger from
-  your own disk.
-- **Hosted service** — a Clio-style API server over the chunk store, serving everything Clio serves
-  plus what it can't (`ledger_data`, full historical state, balance-at-ledger proofs), because we
-  keep the cryptographic source data Clio discards.
-
-Far cheaper to operate than Clio: no ScyllaDB/Cassandra cluster. The data is immutable chunks on
-object storage (S3/R2) behind a lightweight local index — no distributed DB tier to provision,
-replicate, or repair. (See DESIGN_NOTES.md "Cost: no ScyllaDB/Cassandra tier".)
+> The chunk store can also back a query layer (local tool or a hosted, Cassandra-free Clio
+> alternative). That's a design direction, not part of this repo's scope yet — see
+> [DESIGN_NOTES.md](DESIGN_NOTES.md) ("Why Not Clio" and "Cost: no ScyllaDB/Cassandra tier").
 
 ## Build & run
 
