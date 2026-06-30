@@ -32,6 +32,10 @@ Because chunks preserve full SHAMap state, the same data backs a query layer wit
   plus what it can't (`ledger_data`, full historical state, balance-at-ledger proofs), because we
   keep the cryptographic source data Clio discards.
 
+Far cheaper to operate than Clio: no ScyllaDB/Cassandra cluster. The data is immutable chunks on
+object storage (S3/R2) behind a lightweight local index — no distributed DB tier to provision,
+replicate, or repair. (See DESIGN_NOTES.md "Cost: no ScyllaDB/Cassandra tier".)
+
 ## Build & run
 
 ```bash

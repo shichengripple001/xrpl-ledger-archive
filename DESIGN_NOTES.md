@@ -43,6 +43,29 @@ checkpoint + delta streams. The three streams are fetched independently so a tra
 never downloads a multi-GB state checkpoint. Transaction data is now exported and verified; the
 remaining work is the query index + extraction tool itself.
 
+### Cost: no ScyllaDB/Cassandra tier
+
+Clio's dominant cost is its **ScyllaDB/Cassandra cluster** — a distributed database provisioned for
+write throughput and replication: multiple always-on, RAM-heavy, SSD-provisioned nodes plus the
+operational burden of running, repairing, and rebalancing a cluster. The Clio process itself is
+cheap; the database tier is not.
+
+This archive has **no database tier**. The data is immutable, content-addressed chunks, so it lives
+on cheap object storage (S3/R2) or plain disk, and a query server just reads chunk slices through a
+lightweight local index (SQLite/RocksDB). Consequences:
+
+- **Storage** — object storage per-TB is far cheaper than a Scylla cluster's provisioned SSD+RAM,
+  and the data is written roughly once (immutable, deduped).
+- **No cluster, no replication ops** — static files are trivially replicated and CDN-cacheable;
+  read capacity scales horizontally for free.
+- **Elastic** — spin query nodes up/down against the same shared chunk store; no rebalancing,
+  no repair.
+
+Honest tradeoff: Scylla buys very low-latency random point lookups. We trade some of that for an
+index + chunk-range fetch (warm cache / CDN narrows the gap; a latency-critical hot API would add
+its own caching layer). For full historical-state queries Clio cannot serve at all, there is no
+comparison.
+
 ---
 
 ## Why Delta Encoding
