@@ -83,6 +83,12 @@ fn main() -> Result<()> {
     let mut tx_maps = vec![TxMap {
         ledger_seq: args.start,
         ledger_hash: start_ledger_hash,
+        account_hash: start_info.account_hash,
+        drops: start_info.total_coins,
+        parent_close_time: start_info.prev_closing_time,
+        close_time: start_info.closing_time,
+        close_time_resolution: start_info.close_time_resolution,
+        close_flags: start_info.close_flags,
         txns: start_txns,
     }];
 
@@ -117,7 +123,17 @@ fn main() -> Result<()> {
         total_txns += txns.len();
 
         deltas.push(LedgerDelta { ledger_seq: seq, diff });
-        tx_maps.push(TxMap { ledger_seq: seq, ledger_hash: curr_ledger_hash, txns });
+        tx_maps.push(TxMap {
+            ledger_seq: seq,
+            ledger_hash: curr_ledger_hash,
+            account_hash: curr_info.account_hash,
+            drops: curr_info.total_coins,
+            parent_close_time: curr_info.prev_closing_time,
+            close_time: curr_info.closing_time,
+            close_time_resolution: curr_info.close_time_resolution,
+            close_flags: curr_info.close_flags,
+            txns,
+        });
     }
 
     let ledger_count = args.end - args.start;

@@ -488,6 +488,7 @@ dependencies = [
  "clap",
  "hex",
  "xrla-common",
+ "xrla-nudb",
 ]
 
 [[package]]

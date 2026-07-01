@@ -17,5 +17,6 @@
 pub mod dat;
 pub mod keyfile;
 pub mod reader;
+pub mod writer;
 
 pub use reader::NuDBReader;

@@ -1,5 +1,12 @@
 # XRPL Ledger Archive — Test Plan
 
+> **Status as of 2026-07-01**: most of this document was aspirational — it described tests
+> to write, not tests that existed (`grep -rn "#\[test\]" crates` returned zero matches
+> before the import/round-trip work below). The tests marked ✅ **IMPLEMENTED** are real,
+> committed, and passing (`cargo test --workspace`). Everything else in this document is
+> still a plan, not code — do not assume a described test exists just because it's listed
+> here.
+
 ---
 
 ## Test Levels
@@ -24,7 +31,29 @@
 - `test_inner_node_all_children`: bitmask=0xFFFF → 16 children, assert all present
 - `test_inner_node_truncated`: content too short → expect error
 
+**tx_tree.rs** ✅ IMPLEMENTED (`crates/xrla-common/src/tx_tree.rs`)
+- `empty_tree_is_zero_hash`: no transactions → root is `ZERO_HASH`, no nodes
+- `single_tx_root_is_inner_with_one_child`: one tx → root inner has exactly one non-zero
+  slot (matching the tx_hash's first nibble), leaf hash matches the documented formula
+- `two_txns_sharing_first_nibble_split_at_second_level`: two keys sharing nibble 0 produce
+  a second-level inner node, not a collision
+- `write_vl_matches_read_vl_boundaries`: round-trips VL encoding across all three length
+  classes (1/2/3-byte prefixes) against a standalone copy of reader.rs's `read_vl`
+
 #### xrla-nudb
+
+**writer.rs** ✅ IMPLEMENTED (`crates/xrla-nudb/src/writer.rs`)
+- `round_trip_small_store`: write 50 synthetic entries, read every one back via
+  `keyfile::Shard::fetch`, assert byte-identical; assert an absent key returns `None`
+- `round_trip_forces_spill_chain`: 500 entries into a small bucket table, forcing the
+  spill-chain write/read path (not just primary buckets)
+- `real_snapshot_roundtrip_via_writer` *(ignored — needs a real snapshot)*: samples ~200
+  real, rippled-produced records directly from a live mainnet `nudb.dat`, round-trips them
+  through `encode_wire_to_value` → `write_nudb_store` → `Shard::fetch` →
+  `decode_value_to_wire`, and asserts wire-byte equality. Run with:
+  `RIPPLED_DAT=/path/to/nudb.dat cargo test --package xrla-nudb --lib -- --ignored real_snapshot`
+  — passed against the 5.8 GB mainnet shard captured earlier in this project (196/196 nodes
+  round-tripped exactly).
 
 **dat.rs** (value decoding)
 - `test_decode_full_inner`: codec `0x03` + 512 bytes → 512-byte content + Inner type byte
@@ -115,28 +144,48 @@ These are the most important tests. They prove the format is suitable for P2P di
 
 ### 3. Integration Tests
 
-**test_export_import_roundtrip**
-- Export ledger range [N, N+100] from a real rippled NuDB
-- Import into a fresh NuDB
-- Open fresh NuDB with rippled
-- Query ledger N+50 — assert state matches original node
+**two_ledger_chunk_replays_and_verifies** ✅ IMPLEMENTED (`crates/xrla-import/src/main.rs`)
+- Synthetic 2-ledger chunk (checkpoint + 1 delta), built with the *real* hash formulas
+  (`build_tx_tree`, `calculate_ledger_hash`), fed through `replay_chunk` end-to-end
+- Asserts: final live state is exactly ledger B's nodes (ledger A's superseded leaf/root are
+  gone); a tampered stored `ledger_hash` is caught and rejected, not silently accepted
+- This is the wiring test the unit tests above can't be: it wouldn't have caught the
+  original `verify_ledger_hashes` bug (comparing against `checkpoint_hash`, a LedgerHash,
+  instead of the checkpoint's actual `account_hash`) — building this test is what surfaced
+  and fixed that bug
+- **Known gap**: uses hand-built synthetic nodes, not a real multi-ledger mainnet range —
+  see `test_export_import_roundtrip` below for what's still missing
 
-**test_hash_verification**
-- Export chunk for ledger range [N, N+100]
-- For each ledger in range: replay delta, compute root hash
-- Fetch ledger header from rippled node, extract state hash
-- Assert computed root hash == on-chain state hash
-- All 100 ledgers must pass
+**test_export_import_roundtrip** — NOT YET RUN end-to-end
+- Export ledger range [N, N+100] from a real rippled NuDB, import into a fresh NuDB, open
+  with a real rippled process, query ledger N+50 — assert state matches original node
+- Blocked in this environment: the populated `ledger.db` used for earlier verification
+  work is gone (only an empty one remains); a real multi-GB `nudb.dat`/`nudb.key` shard is
+  still present and was used for `real_snapshot_roundtrip_via_writer` above, but that test
+  only proves node *content* round-trips, not a full ledger range with real header data,
+  and nothing here has been tested against an actual rippled process opening the result
+- To close this gap: re-run `xrla-export` against a fresh rippled snapshot with a populated
+  `ledger.db`, then `xrla-import` the result, then point a real rippled at the output and
+  query it
+
+**test_hash_verification** — superseded by `two_ledger_chunk_replays_and_verifies` for the
+wiring, and by `test_correctness_ledger_hash` (below) for the formula itself; still open at
+the *real multi-ledger, real rippled process* level described in `test_export_import_roundtrip`.
 
 **test_chunk_tamper_detection**
 - Export a valid chunk
 - Flip one byte in the body
 - Attempt to deserialize → expect `ChunkError::HashMismatch`
+- `deserialize_chunk` (`crates/xrla-common/src/serialize.rs`) already implements this check
+  on every read; no dedicated test exists yet exercising a deliberately-flipped byte
 
 **test_import_rejects_corrupt_chunk**
 - Export a valid chunk
 - Flip one byte in a delta
 - Run xrla-import → expect failure with clear error message
+- Partially covered by `two_ledger_chunk_replays_and_verifies`'s tampered-`ledger_hash`
+  case; a dedicated test flipping bytes in an *added node* (not just the stored hash)
+  would exercise a different failure path and is still open
 
 ---
 

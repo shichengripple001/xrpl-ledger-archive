@@ -70,6 +70,11 @@ fn write_u32be(w: &mut impl Write, v: u32) -> Result<()> {
     Ok(())
 }
 
+fn write_u64be(w: &mut impl Write, v: u64) -> Result<()> {
+    w.write_all(&v.to_be_bytes())?;
+    Ok(())
+}
+
 fn write_bytes(w: &mut impl Write, b: &[u8]) -> Result<()> {
     w.write_all(b)?;
     Ok(())
@@ -159,6 +164,12 @@ fn write_delta(w: &mut impl Write, delta: &LedgerDelta) -> Result<()> {
 fn write_tx_map(w: &mut impl Write, tx_map: &TxMap) -> Result<()> {
     write_u32be(w, tx_map.ledger_seq)?;
     write_bytes(w, &tx_map.ledger_hash)?;
+    write_bytes(w, &tx_map.account_hash)?;
+    write_u64be(w, tx_map.drops)?;
+    write_u32be(w, tx_map.parent_close_time)?;
+    write_u32be(w, tx_map.close_time)?;
+    write_u8(w, tx_map.close_time_resolution)?;
+    write_u8(w, tx_map.close_flags)?;
     write_u16be(w, tx_map.txns.len() as u16)?;
 
     let mut txns = tx_map.txns.clone();
@@ -309,9 +320,20 @@ fn read_delta(r: &mut impl Read) -> Result<LedgerDelta, ChunkError> {
     })
 }
 
+fn read_u64be(r: &mut impl Read) -> Result<u64, ChunkError> {
+    let b = read_exact(r, 8)?;
+    Ok(u64::from_be_bytes(b.try_into().unwrap()))
+}
+
 fn read_tx_map(r: &mut impl Read) -> Result<TxMap, ChunkError> {
-    let ledger_seq  = read_u32be(r)?;
-    let ledger_hash = read_hash(r)?;
+    let ledger_seq            = read_u32be(r)?;
+    let ledger_hash           = read_hash(r)?;
+    let account_hash          = read_hash(r)?;
+    let drops                 = read_u64be(r)?;
+    let parent_close_time     = read_u32be(r)?;
+    let close_time            = read_u32be(r)?;
+    let close_time_resolution = read_u8(r)?;
+    let close_flags           = read_u8(r)?;
     let tx_count    = read_u16be(r)? as usize;
     let mut txns    = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
@@ -322,5 +344,9 @@ fn read_tx_map(r: &mut impl Read) -> Result<TxMap, ChunkError> {
         let meta_blob = read_exact(r, meta_len)?;
         txns.push(TxRecord { tx_hash, tx_blob, meta_blob });
     }
-    Ok(TxMap { ledger_seq, ledger_hash, txns })
+    Ok(TxMap {
+        ledger_seq, ledger_hash, account_hash, drops,
+        parent_close_time, close_time, close_time_resolution, close_flags,
+        txns,
+    })
 }

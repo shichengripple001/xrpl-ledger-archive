@@ -25,7 +25,7 @@ use std::path::Path;
 
 use anyhow::{bail, Result};
 
-use xrla_common::shamap::{wire_type, Hash256};
+use xrla_common::shamap::{wire_type, Hash256, NodeType};
 
 const NUDB_MAGIC: &[u8; 8] = b"nudb.dat";
 const KEY_SIZE: usize = 32;
@@ -297,6 +297,38 @@ fn encoded_blob_to_wire(data: &[u8]) -> Option<Vec<u8>> {
             None
         }
     }
+}
+
+/// HashPrefix::InnerNode ("MIN\0") — embedded in the decompressed EncodedBlob for inner nodes.
+const HASH_PREFIX_INNER_NODE: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00];
+
+/// Encode XRLA wire content (content bytes, WITHOUT the trailing type byte) back into a
+/// valid NuDB stored value. Inverse of `decode_value_to_wire` / `nudb_value_to_wire_at`.
+///
+/// Always uses codec 0x00 (raw/uncompressed) rather than LZ4 or the sparse-inner codec —
+/// simpler, and it reuses the already-verified `decode_raw`/`encoded_blob_to_wire` read
+/// path, so a value written here round-trips through `decode_value_to_wire` byte-for-byte.
+/// This has been validated by reading written stores back with `keyfile::Shard::fetch`;
+/// it has NOT been tested against a real rippled process.
+pub fn encode_wire_to_value(content: &[u8], node_type: &NodeType) -> Vec<u8> {
+    let mut value = Vec::with_capacity(1 + 8 + 1 + content.len() + 4);
+    value.push(CODEC_RAW);
+    value.extend_from_slice(&[0u8; 8]); // EncodedBlob: 8 zero bytes
+
+    if node_type.is_inner() {
+        value.push(NOTYPE_UNKNOWN);
+        value.extend_from_slice(&HASH_PREFIX_INNER_NODE);
+        value.extend_from_slice(content); // 512 bytes
+    } else {
+        let notype = match node_type {
+            NodeType::AccountState => NOTYPE_ACCOUNT,
+            NodeType::TransactionWithMeta | NodeType::Transaction => NOTYPE_TRANSACTION,
+            _ => unreachable!("is_inner() covered Inner/CompressedInner above"),
+        };
+        value.push(notype);
+        value.extend_from_slice(content);
+    }
+    value
 }
 
 /// LEB128 unsigned varint decoder. Returns (value, bytes_consumed) or None on truncation.

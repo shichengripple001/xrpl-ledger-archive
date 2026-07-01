@@ -3,7 +3,11 @@ use thiserror::Error;
 
 pub const MAGIC_HEADER: &[u8; 4] = b"XRLA";
 pub const MAGIC_FOOTER: &[u8; 4] = b"ENDX";
-pub const FORMAT_VERSION: u8 = 1;
+/// Version 2: TX_MAPS gained account_hash + drops + close-time header fields, making
+/// LedgerHash independently reconstructable from chunk contents alone (see
+/// "Verification without full history" in spec/chunk-format.md). Version 1 chunks are
+/// not readable by this version — never shipped past this repo, so no compat shim needed.
+pub const FORMAT_VERSION: u8 = 2;
 
 pub const NETWORK_MAINNET: u32 = 1;
 pub const NETWORK_TESTNET: u32 = 2;
@@ -17,7 +21,14 @@ pub struct TxRecord {
     pub meta_blob: Vec<u8>,
 }
 
-/// All transactions for one ledger.
+/// All transactions for one ledger, plus the header fields needed to independently
+/// reconstruct this ledger's full LedgerHash from chunk contents alone:
+///   - `tx_hash` is not stored — rebuild the tx SHAMap from `txns` (see `tx_tree`).
+///   - `parent_hash` is not stored — it's the previous entry's `ledger_hash` (or, for the
+///     first ledger in a chunk, an externally obtained anchor; see spec "Verification
+///     without full history").
+///   - `account_hash`, `drops`, and the close-time fields ARE stored here because nothing
+///     else in the chunk derives them.
 #[derive(Debug, Clone)]
 pub struct TxMap {
     pub ledger_seq: u32,
@@ -26,6 +37,14 @@ pub struct TxMap {
     /// against the source database. Lets a buyer walk the parent_hash chain-of-custody
     /// through the chunk without needing per-ledger network access.
     pub ledger_hash: Hash256,
+    /// AccountSetHash — this ledger's state SHAMap root. Compared directly against the
+    /// root produced by replaying checkpoint+deltas on import.
+    pub account_hash: Hash256,
+    pub drops: u64,
+    pub parent_close_time: u32,
+    pub close_time: u32,
+    pub close_time_resolution: u8,
+    pub close_flags: u8,
     pub txns: Vec<TxRecord>,
 }
 

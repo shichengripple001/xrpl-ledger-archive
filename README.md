@@ -51,6 +51,21 @@ PoC export path proven end-to-end on mainnet and **verified against on-chain has
   all 51 ledgers, embedding `parent_hash` so a chunk is a self-contained hash chain (see
   DESIGN_NOTES.md "Tamper detection without a second full-history copy").
 
-Open: round-trip verification (`xrla-import` replay), state-leaf hash coverage, and validating the
-storage floor at scale. See PLAN.md. (A deterministic-but-wrong sparse-inner decode bug was caught
-here only by the on-chain hash check — determinism alone is not correctness.)
+`xrla-import` now really does something (it used to be two stubs — a `verify_ledger_hashes`
+that only printed, and a NuDB writer that only counted). It replays checkpoint+deltas,
+rebuilds each ledger's transaction tree, and independently recomputes + asserts every
+transaction's own hash, the account-state root, and the full chained `LedgerHash` — bailing
+on any mismatch instead of trusting the file. It then writes a real NuDB `.dat`/`.key` pair.
+Validated so far: a synthetic 2-ledger chunk exercising the whole chain (including a
+deliberately-tampered `LedgerHash` being caught), plus ~200 real, rippled-produced node
+values sampled from a live mainnet shard round-tripped byte-for-byte through the new
+writer. **Not yet done**: running the writer's output through an actual rippled process, and
+a full multi-ledger round trip against real chain data (the populated `ledger.db` used
+earlier is no longer available in this environment — see TEST_PLAN.md).
+
+Open: full real-data round trip through an actual rippled process, per-node state-leaf hash
+coverage (only the root is independently checked, not every intermediate inner node, on the
+import side), checkpoint sparsity across chunks (every `.xrla` file still bundles its own
+full checkpoint — see DESIGN_NOTES.md), and validating the storage floor at scale. See
+PLAN.md. (A deterministic-but-wrong sparse-inner decode bug was caught here only by the
+on-chain hash check — determinism alone is not correctness.)
