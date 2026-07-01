@@ -47,6 +47,9 @@ PoC export path proven end-to-end on mainnet and **verified against on-chain has
 - 50-ledger state deltas, deterministic across runs.
 - Transactions + metadata (4,500 over 51 ledgers) — every txid authentic and each ledger's
   tx-tree root matches the on-chain `TransSetHash`.
+- Full `LedgerHash` per ledger — independently recomputed and verified against `ledger.db` for
+  all 51 ledgers, embedding `parent_hash` so a chunk is a self-contained hash chain (see
+  DESIGN_NOTES.md "Tamper detection without a second full-history copy").
 
 Open: round-trip verification (`xrla-import` replay), state-leaf hash coverage, and validating the
 storage floor at scale. See PLAN.md. (A deterministic-but-wrong sparse-inner decode bug was caught

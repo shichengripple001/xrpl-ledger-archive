@@ -20,6 +20,37 @@ pub fn sha512half(data: &[u8]) -> Hash256 {
     out
 }
 
+/// Fields needed to independently recompute a ledger's LedgerHash.
+/// Mirrors rippled's LedgerHeader; source: libxrpl/protocol/LedgerHeader.cpp
+/// `calculateLedgerHash()`, verified against real mainnet data.
+pub struct LedgerHashInput {
+    pub seq: u32,
+    pub drops: u64,
+    pub parent_hash: Hash256,
+    pub tx_hash: Hash256,
+    pub account_hash: Hash256,
+    pub parent_close_time: u32,
+    pub close_time: u32,
+    pub close_time_resolution: u8,
+    pub close_flags: u8,
+}
+
+/// Recompute the LedgerHash: sha512half(HashPrefix::LedgerMaster ("LWR\0") + fields).
+pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
+    let mut buf = Vec::with_capacity(4 + 4 + 8 + 32 + 32 + 32 + 4 + 4 + 1 + 1);
+    buf.extend_from_slice(&[0x4C, 0x57, 0x52, 0x00]); // HashPrefix::LedgerMaster
+    buf.extend_from_slice(&h.seq.to_be_bytes());
+    buf.extend_from_slice(&h.drops.to_be_bytes());
+    buf.extend_from_slice(&h.parent_hash);
+    buf.extend_from_slice(&h.tx_hash);
+    buf.extend_from_slice(&h.account_hash);
+    buf.extend_from_slice(&h.parent_close_time.to_be_bytes());
+    buf.extend_from_slice(&h.close_time.to_be_bytes());
+    buf.push(h.close_time_resolution);
+    buf.push(h.close_flags);
+    sha512half(&buf)
+}
+
 // ---------------------------------------------------------------------------
 // Write helpers
 // ---------------------------------------------------------------------------
@@ -127,6 +158,7 @@ fn write_delta(w: &mut impl Write, delta: &LedgerDelta) -> Result<()> {
 
 fn write_tx_map(w: &mut impl Write, tx_map: &TxMap) -> Result<()> {
     write_u32be(w, tx_map.ledger_seq)?;
+    write_bytes(w, &tx_map.ledger_hash)?;
     write_u16be(w, tx_map.txns.len() as u16)?;
 
     let mut txns = tx_map.txns.clone();
@@ -278,9 +310,10 @@ fn read_delta(r: &mut impl Read) -> Result<LedgerDelta, ChunkError> {
 }
 
 fn read_tx_map(r: &mut impl Read) -> Result<TxMap, ChunkError> {
-    let ledger_seq = read_u32be(r)?;
-    let tx_count   = read_u16be(r)? as usize;
-    let mut txns   = Vec::with_capacity(tx_count);
+    let ledger_seq  = read_u32be(r)?;
+    let ledger_hash = read_hash(r)?;
+    let tx_count    = read_u16be(r)? as usize;
+    let mut txns    = Vec::with_capacity(tx_count);
     for _ in 0..tx_count {
         let tx_hash   = read_hash(r)?;
         let tx_len    = read_u32be(r)? as usize;
@@ -289,5 +322,5 @@ fn read_tx_map(r: &mut impl Read) -> Result<TxMap, ChunkError> {
         let meta_blob = read_exact(r, meta_len)?;
         txns.push(TxRecord { tx_hash, tx_blob, meta_blob });
     }
-    Ok(TxMap { ledger_seq, txns })
+    Ok(TxMap { ledger_seq, ledger_hash, txns })
 }

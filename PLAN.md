@@ -205,6 +205,10 @@ Lesson: determinism ≠ correctness — always verify against on-chain hashes.
 - ✅ Two independent exports → byte-identical chunk files
 - ✅ Checkpoint root hash == on-chain `AccountSetHash` (state tree fully verified)
 - ✅ Transactions: txid authenticity + per-ledger tx-tree root == on-chain `TransSetHash`
+- ✅ Full `LedgerHash` per ledger: exporter now captures `PrevHash`/`TotalCoins`/close-time
+  fields from `ledger.db`, independently recomputes `LedgerHash` (verified formula — see
+  `serialize.rs::calculate_ledger_hash`), aborts on mismatch, and stores it in every `TxMap`
+  entry. Verified on all 51 ledgers of the test range against real chain data.
 - ⬜ Per-delta replay: reconstructed `AccountSetHash` matches at every ledger
       *(needs `xrla-import` replay path — Phase 1)*
 - ✅ Delta sizes measured and logged
@@ -214,8 +218,13 @@ Still open in Phase 0:
   `AccountSetHash` matches the on-chain value (needs `xrla-import`).
 - State leaf-content verification: recompute account-state leaf hashes (not just inner/root)
   for full state coverage. (Transaction leaves are already fully verified via the tx-tree root.)
-- Full ledger-hash verification: now feasible — combine the verified state root + tx root
-  (+ ledger header fields) to check the complete ledger hash.
+
+**Why the per-ledger `LedgerHash` matters — chain-of-custody without full history.** Because
+`LedgerHash` embeds `parent_hash` (the previous ledger's hash), storing it for every ledger makes
+each chunk a self-contained hash chain. A verifier needs only **one** independently obtained
+anchor hash (genesis, a skip-list flag-ledger hash from any live node, or a single RPC call) to
+prove an entire multi-terabyte archive wasn't tampered with anywhere — the same trust model as a
+blockchain. See `spec/chunk-format.md` "Verification without full history."
 
 ### Phase 1: Complete importer
 

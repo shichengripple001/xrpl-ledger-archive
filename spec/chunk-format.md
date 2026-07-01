@@ -110,11 +110,20 @@ Entries appear in ascending ledger sequence order.
 
 ### TX Map Entry
 
-| Field      | Type   | Size     | Description                            |
-|------------|--------|----------|----------------------------------------|
-| ledger_seq | uint32 | 4        | Ledger sequence                        |
-| tx_count   | uint16 | 2        | Number of transactions                 |
-| txs[]      | —      | variable | Transaction records                    |
+| Field       | Type   | Size     | Description                                          |
+|-------------|--------|----------|-------------------------------------------------------|
+| ledger_seq  | uint32 | 4        | Ledger sequence                                       |
+| ledger_hash | bytes  | 32       | This ledger's full LedgerHash, recomputed + verified  |
+| tx_count    | uint16 | 2        | Number of transactions                                |
+| txs[]       | —      | variable | Transaction records                                   |
+
+`ledger_hash` = `SHA512half(HashPrefix::LedgerMaster + seq + drops + parent_hash + tx_hash
++ account_hash + parent_close_time + close_time + close_time_resolution + close_flags)`.
+The exporter recomputes this from the source ledger DB and aborts if it doesn't match the
+DB's stored value. Because it embeds `parent_hash`, storing it for every ledger lets a
+verifier walk the chain-of-custody link between consecutive ledgers using only this chunk —
+no live network query needed except for one external anchor hash (see "Verification without
+full history" below).
 
 ### Transaction Record
 
@@ -148,15 +157,50 @@ To verify a chunk file:
 4. Load checkpoint nodes into an in-memory SHAMap, compute root hash
 5. Assert root hash == header.checkpoint_hash
    (checkpoint_hash is the ledger hash at start_ledger — fetch from network to verify)
-6. For each delta (ledger seq start+1 to end):
-   a. Apply added nodes to SHAMap
-   b. Remove deleted nodes from SHAMap
-   c. Compute new root hash
-   d. Assert root hash == ledger header hash for this ledger seq
-      (fetch ledger header from network, or from TX_MAPS section)
-7. If all assertions pass — chunk is valid
+6. For each ledger (start to end):
+   a. Apply added/deleted nodes to the state SHAMap (skip for start_ledger, it's the checkpoint);
+      compute the new `AccountSetHash`
+   b. Rebuild the transaction SHAMap from that ledger's TX_MAPS entry; compute `TransSetHash`
+   c. Recompute `LedgerHash` from `(seq, drops, parent_hash, tx_hash, account_hash, close-time
+      fields)` — all of which are either derivable from the chunk or embedded in the TX_MAPS
+      entry itself — and assert it equals the stored `ledger_hash`
+   d. Assert this ledger's `ledger_hash` field equals `parent_hash` used to compute the *next*
+      ledger's `ledger_hash` (chain-of-custody link between consecutive ledgers)
+7. If all assertions pass — the chunk is internally consistent. To confirm it also matches the
+   real network (not just itself), see "Verification without full history" below.
 
 ---
+
+## Verification without full history
+
+A chunk can prove internal consistency entirely offline (step 6 above). To prove the *chunk
+itself* is authentic — not just self-consistent — a verifier needs exactly **one** independently
+obtained `LedgerHash` at or after the ledger they care about, then walks it backward:
+
+- Every ledger's `LedgerHash` embeds `parent_hash`, the previous ledger's `LedgerHash`. So a chunk
+  spanning many ledgers is itself a hash chain, and chaining consecutive chunks together
+  (`checkpoint_hash` of chunk N+1 should equal the last `ledger_hash` of chunk N) extends that
+  chain across the whole archive.
+- Cryptographic hashes have the avalanche property: altering any transaction, account, or ledger
+  anywhere breaks every hash downstream of that point. There is no way to tamper with the middle
+  of an archive and still land on a correct anchor hash at the end.
+- A single trusted anchor is enough to validate an arbitrarily large archive. Cheapest sources,
+  in order:
+  1. **The genesis ledger hash** — fixed forever, publicly known, free.
+  2. **A skip-list-derived flag-ledger hash** — every current ledger's state tree contains a
+     `LedgerHashes` object (`ltLEDGER_HASHES`) with the last 256 ledger hashes, and flag ledgers
+     (multiples of 256) get their hash permanently chained forward. This lets *any* currently
+     synced node — even one with zero retained history — answer "what was ledger N's hash" for
+     any N, without ever having stored ledger N itself.
+  3. **A live RPC query** to any node (full-history or not) for a ledger still inside its
+     retention window — trivial if the chunk's range is recent.
+  4. **Any independently published hash** — another provider's manifest, a historical record —
+     the more independent sources agree, the stronger the trust.
+
+This is the same trust model as a blockchain: verifying the tip (or any single validated point)
+transitively verifies everything chained behind it. A buyer of a full-history "tape" does not need
+a second full-history copy to catch tampering — they need the chunk's own hash chain plus one
+independently obtained anchor.
 
 ## Partial Fetch & Stream Separation
 

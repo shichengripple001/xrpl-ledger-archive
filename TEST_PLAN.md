@@ -94,6 +94,17 @@ These are the most important tests. They prove the format is suitable for P2P di
 - Result: 4,500/4,500 txids authentic; 51/51 ledger tx-tree roots match ✅
   (proves completeness + metadata correctness, not just per-tx authenticity)
 
+**test_correctness_ledger_hash**  ✅ verified 2026-06-30
+- Verified `calculate_ledger_hash()` formula (seq, drops, parent_hash, tx_hash, account_hash,
+  parent_close_time, close_time, close_time_resolution, close_flags, HashPrefix::LedgerMaster
+  "LWR\0") against a real ledger.db row — recomputed hash matched the DB's `LedgerHash` exactly
+- Exporter now recomputes + asserts this for every ledger in the range (aborts on mismatch) and
+  stores it in each `TxMap.ledger_hash`
+- Result: 51/51 ledgers verified during export; extracted `ledger_hash` for ledger 105277428
+  from the output chunk matches the hand-verified value `1E0805A3…` ✅
+- Regression test to add: a synthetic ledger row with a deliberately wrong field (e.g. flipped
+  `CloseFlags`) must make the exporter `bail!`, not silently accept it
+
 **test_determinism_different_node_insertion_order**
 - Build same SHAMap tree by inserting nodes in two different orders
 - Export to chunk from each

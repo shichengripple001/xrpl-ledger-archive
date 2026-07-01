@@ -21,6 +21,11 @@ pub struct TxRecord {
 #[derive(Debug, Clone)]
 pub struct TxMap {
     pub ledger_seq: u32,
+    /// This ledger's full LedgerHash, independently recomputed by the exporter from
+    /// (seq, drops, parent_hash, tx_hash, account_hash, close-time fields) and verified
+    /// against the source database. Lets a buyer walk the parent_hash chain-of-custody
+    /// through the chunk without needing per-ledger network access.
+    pub ledger_hash: Hash256,
     pub txns: Vec<TxRecord>,
 }
 

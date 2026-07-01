@@ -102,6 +102,19 @@ Result: byte-identical output from any two independent exporters on the same dat
 This enables trustless distribution: recipients verify by chunk_hash, not by trusting
 the sender. The chunk_hash is reproducible by anyone with the same ledger data.
 
+**Tamper detection without a second full-history copy.** Every ledger's `LedgerHash` embeds
+`parent_hash` — the previous ledger's hash — so a chunk (and a chain of consecutive chunks) is
+itself a hash chain, exactly like a blockchain. We now capture and independently recompute
+`LedgerHash` per ledger (verified against real chain data: `serialize.rs::calculate_ledger_hash`,
+formula confirmed against rippled's `calculateLedgerHash()` and a live mainnet row). Because of
+the avalanche property of cryptographic hashes, tampering with any transaction or account anywhere
+in an archive breaks every hash downstream of it. Consequence: a buyer of a "tape" (a purchased
+full-history archive) needs only **one** independently obtained anchor hash — the genesis hash
+(free, fixed forever), a skip-list flag-ledger hash from any live node (no full history required —
+`ltLEDGER_HASHES` chains back to genesis every 256 ledgers), or a single RPC call — to prove the
+entire archive is authentic, not just self-consistent. See `spec/chunk-format.md` "Verification
+without full history."
+
 **Determinism is necessary but NOT sufficient — it does not imply correctness.** A deterministic
 *decode* bug produces stable, reproducible, byte-identical — and wrong — output. We hit exactly
 this: sparse inner nodes were decoded with the branch mask bit-reversed (`mask & (1<<s)` instead
