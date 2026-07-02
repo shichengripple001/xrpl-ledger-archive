@@ -492,6 +492,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xrla-inspect"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "xrla-common",
+]
+
+[[package]]
 name = "xrla-nudb"
 version = "0.1.0"
 dependencies = [

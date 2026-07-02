@@ -4,6 +4,7 @@ members = [
     "crates/xrla-nudb",
     "crates/xrla-export",
     "crates/xrla-import",
+    "crates/xrla-inspect",
 ]
 resolver = "2"
 

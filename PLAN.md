@@ -308,3 +308,21 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
 
 5. Clarify how snapshots are taken in production (stop-copy-restart vs. NuDB's own consistent
    snapshot, vs. reading a live DB safely).
+
+6. **Automated checkpoint anchoring** (`--verify-checkpoint-rpc`): a chunk's checkpoint
+   ledger is currently only self-consistency-checked (recomputed from `ledger.db`'s own
+   fields) — this can't catch a single diverged/amendment-blocked source serving an
+   internally-consistent-but-wrong fork (the exact failure mode discussed in a Clio incident
+   where "clio trusts rippled data" with no cross-check led to corrupted ETL state from a
+   diverging source). Close this by querying independent nodes' `ledger` RPC for the
+   checkpoint's `ledger_hash` and requiring quorum agreement:
+   - **Recent ledgers** (within any public node's retention window): query 2-3 independent
+     public endpoints (e.g. `s1.ripple.com`, `s2.ripple.com`, `xrplcluster.com`), require
+     `validated: true` + matching `ledger_hash`. Already proven manually once (see
+     `spec/chunk-format.md` "Verification without full history"); just needs wiring into
+     `xrla-export`/`xrla-import` as an automated flag.
+   - **Old ledgers** (outside most nodes' retention): skip multi-node quorum, source directly
+     from a full-history node already trusted as the export source. Note Ripple's own FH
+     nodes are IP-allowlisted (`secure_gateway`), not open like `s1`/`s2` — a genuinely
+     independent second FH source for cross-checks would need a self-hosted FH node or a
+     non-Ripple-operated public FH provider.
