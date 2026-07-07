@@ -64,16 +64,14 @@ NuDB snapshot (4,500 real transactions, 27M+ state nodes, every ledger's account
 chained LedgerHash independently verified). **Not yet done**: running the writer's output
 through an actual rippled process (see TEST_PLAN.md).
 
-On import, every inner state-tree node's own hash is now independently recomputed from its
-raw content and checked against its claimed identity (`xrla_common::state_tree`) — not just
-the overall root. This is real-data-validated (the same formula confirmed in Phase 0 against
-7.9M real checkpoint inner nodes) and catches source-side corruption or decode bugs at any
-single node, not only ones large enough to shift the root.
+On import, every state-tree node's own hash — inner *and* leaf (`AccountState`) — is now
+independently recomputed from its raw content and checked against its claimed identity
+(`xrla_common::state_tree`), not just the overall root. Both formulas are real-data-validated
+exhaustively (not sampled): all 27,031,655 nodes in a real mainnet checkpoint (7,912,690
+inner + 19,118,965 leaves), zero mismatches. This catches source-side corruption or decode
+bugs at any single node, not only ones large enough to shift the root.
 
-Open: **leaf-node (`AccountState`) hash coverage** — the formula needs the same
-real-NuDB-snapshot validation the inner-node and transaction formulas already got, and no
-such snapshot was available when this was last worked on (see PLAN.md "Immediate TODOs").
-Also open: automated checkpoint RPC anchoring (checking a chunk's first ledger against
+Open: automated checkpoint RPC anchoring (checking a chunk's first ledger against
 independent nodes, not just self-consistency), running the writer's output through an actual
 rippled process, checkpoint sparsity across chunks (every `.xrla` file still bundles its own
 full checkpoint — see DESIGN_NOTES.md), and validating the storage floor at scale. See

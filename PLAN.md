@@ -213,11 +213,13 @@ Lesson: determinism ≠ correctness — always verify against on-chain hashes.
   `AccountSetHash`, and asserts it against the stored value. Run against a real 51-ledger
   mainnet export/import round trip (4,500 txns, 27M+ state nodes) — every ledger passed.
 - ✅ Delta sizes measured and logged
+- ✅ State leaf-content verification: every node in the state tree — inner *and*
+  `AccountState` leaves — is now independently recomputed from raw content and checked
+  against its own claimed hash on import (`xrla_common::state_tree`), not just the root.
+  Validated exhaustively against a real mainnet checkpoint: all 27,031,655 nodes
+  (7,912,690 inner + 19,118,965 leaves), zero mismatches. See Immediate TODOs item 7.
 
-Still open in Phase 0:
-- State leaf-content verification: recompute account-state (`AccountState`) *leaf* node
-  hashes, not just inner nodes — see Immediate TODOs item 7. (Inner-node hashes and
-  transaction leaves are both fully independently re-verified now.)
+Phase 0 is now fully closed.
 
 **Why the per-ledger `LedgerHash` matters — chain-of-custody without full history.** Because
 `LedgerHash` embeds `parent_hash` (the previous ledger's hash), storing it for every ledger makes
@@ -327,15 +329,13 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
      independent second FH source for cross-checks would need a self-hosted FH node or a
      non-Ripple-operated public FH provider.
 
-7. **Leaf-node (`AccountState`) hash verification** — ✅ inner nodes done
-   (`xrla_common::state_tree::verify_inner_nodes`, wired into `xrla-import`'s replay path,
-   real-data-validated formula from Phase 0). Leaf/`AccountState` nodes are still
-   unimplemented: every state object's content is trusted against its NuDB-assigned hash
-   without independently recomputing it, unlike transactions (`tx_tree`) which already get
-   this treatment. Blocked on having a real NuDB snapshot to validate a candidate formula
-   against — public RPC (`ledger_data`/`ledger_entry`) exposes an object's data and ledger
-   index but not the internal SHAMap leaf-node hash, so this can't be confirmed without
-   direct file access to a real store, the same way the inner-node and tx-leaf formulas were
-   originally confirmed. Do not guess this formula and ship it as "verified" without that
-   validation step — a wrong formula would silently produce false confidence either way
-   (false passes or false failures).
+7. **Leaf-node (`AccountState`) hash verification** — ✅ done. A real rippled Docker
+   snapshot (`xrpl-sensor` container, stopped but its volumes intact) turned out to still be
+   available and was used to derive and confirm the formula: leaf nodes hash as
+   `SHA512half(content)` directly, no `HashPrefix` needed — rippled's on-disk payload
+   already embeds whatever it needs, the same pattern already known for transaction leaves.
+   Confirmed against the *entire* real checkpoint (27,031,655 nodes: 7,912,690 inner +
+   19,118,965 leaves), zero mismatches — not a sample. Implemented in
+   `xrla_common::state_tree::verify_state_nodes` (covers both inner and leaf nodes now) and
+   wired into `xrla-import`'s replay path; real-data-gated regression test at
+   `xrla-nudb/src/reader.rs::real_snapshot_state_nodes_self_verify`.

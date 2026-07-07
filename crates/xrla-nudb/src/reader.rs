@@ -281,3 +281,47 @@ fn read_vl(b: &[u8]) -> Result<(usize, usize)> {
         anyhow::bail!("vl: invalid length byte {b0}")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xrla_common::state_tree::verify_state_nodes;
+
+    /// Validates `xrla_common::state_tree`'s node-hash formulas against a real mainnet
+    /// checkpoint — the entire reachable state tree from a real ledger's `AccountSetHash`,
+    /// not a sample. This is how the leaf-node formula (`SHA512half(content)`, no prefix)
+    /// was originally derived and confirmed: tried candidate formulas against real nodes
+    /// until one matched every single one.
+    ///
+    /// Requires real rippled NuDB shards on disk:
+    ///   RIPPLED_DAT_PATHS=/path/shard0/nudb.dat,/path/shard1/nudb.dat \
+    ///   RIPPLED_ACCOUNT_HASH=<hex AccountSetHash for that checkpoint ledger> \
+    ///   cargo test --package xrla-nudb --lib -- --ignored real_snapshot_state_nodes --nocapture
+    ///
+    /// Last run against a real mainnet checkpoint (ledger 105277428): 7,912,690 inner +
+    /// 19,118,965 leaf nodes, 27,031,655 total, zero mismatches.
+    #[test]
+    #[ignore]
+    fn real_snapshot_state_nodes_self_verify() {
+        let dat_paths: Vec<PathBuf> = std::env::var("RIPPLED_DAT_PATHS")
+            .expect("set RIPPLED_DAT_PATHS (comma-separated .dat paths)")
+            .split(',')
+            .map(PathBuf::from)
+            .collect();
+        let root_hex = std::env::var("RIPPLED_ACCOUNT_HASH").expect("set RIPPLED_ACCOUNT_HASH");
+        let root_bytes = hex::decode(root_hex.trim()).expect("valid hex");
+        let root: Hash256 = root_bytes.try_into().expect("32 bytes");
+
+        let nudb = NuDBReader::open(&dat_paths).expect("open real NuDB shards");
+        let nodes = nudb.collect_reachable(&root).expect("walk real checkpoint");
+        assert!(nodes.len() > 1_000_000, "expected a real full checkpoint, got {} nodes", nodes.len());
+
+        match verify_state_nodes(&nodes) {
+            Ok(()) => println!(
+                "real_snapshot_state_nodes_self_verify: {} nodes, 0 mismatches",
+                nodes.len()
+            ),
+            Err(bad_hash) => panic!("node {} does not hash to its own claimed content", hex::encode(bad_hash)),
+        }
+    }
+}

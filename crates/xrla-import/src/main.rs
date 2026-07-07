@@ -24,7 +24,7 @@ use clap::Parser;
 use xrla_common::chunk::{Chunk, TxMap};
 use xrla_common::serialize::{calculate_ledger_hash, deserialize_chunk, LedgerHashInput};
 use xrla_common::shamap::{Hash256, InnerNode, NodeType, SHAMapNode};
-use xrla_common::state_tree::verify_inner_nodes;
+use xrla_common::state_tree::verify_state_nodes;
 use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
 
 #[derive(Parser, Debug)]
@@ -112,9 +112,9 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
     }
     if verify {
         verify_txns_authentic(cp)?;
-        if let Err(bad_hash) = verify_inner_nodes(&chunk.checkpoint) {
+        if let Err(bad_hash) = verify_state_nodes(&chunk.checkpoint) {
             bail!(
-                "checkpoint: inner node {} does not hash to its own claimed content \
+                "checkpoint: node {} does not hash to its own claimed content \
                  (source data corruption or a decode bug)",
                 hex::encode(bad_hash)
             );
@@ -124,11 +124,11 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
     tx_nodes.extend(nodes);
     if verify {
         println!(
-            "  ledger {} (checkpoint): account_hash OK, {} txns authentic, {} inner nodes \
+            "  ledger {} (checkpoint): account_hash OK, {} txns authentic, {} state nodes \
              self-consistent (LedgerHash needs an external parent_hash anchor — not verified here)",
             cp.ledger_seq,
             cp.txns.len(),
-            chunk.checkpoint.iter().filter(|n| n.node_type == NodeType::Inner).count()
+            chunk.checkpoint.len()
         );
     }
 
@@ -161,9 +161,9 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
         if verify {
             verify_txns_authentic(tx_map)?;
 
-            if let Err(bad_hash) = verify_inner_nodes(&delta.diff.added) {
+            if let Err(bad_hash) = verify_state_nodes(&delta.diff.added) {
                 bail!(
-                    "ledger {}: inner node {} does not hash to its own claimed content \
+                    "ledger {}: node {} does not hash to its own claimed content \
                      (source data corruption or a decode bug)",
                     tx_map.ledger_seq,
                     hex::encode(bad_hash)
@@ -199,11 +199,11 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
                 );
             }
             println!(
-                "  ledger {}: account_hash OK, {} txns authentic, {} inner nodes self-consistent, \
+                "  ledger {}: account_hash OK, {} txns authentic, {} state nodes self-consistent, \
                  LedgerHash OK (chained to parent)",
                 tx_map.ledger_seq,
                 tx_map.txns.len(),
-                delta.diff.added.iter().filter(|n| n.node_type == NodeType::Inner).count()
+                delta.diff.added.len()
             );
         }
 
@@ -292,8 +292,12 @@ mod tests {
     use xrla_common::serialize::sha512half;
     use xrla_common::shamap::SHAMapDiff;
 
+    /// A leaf node with its own hash correctly derived from content (`SHA512half(content)`,
+    /// no prefix — see `state_tree` module docs), so it survives `verify_state_nodes`.
     fn leaf(tag: u8) -> SHAMapNode {
-        SHAMapNode { hash: [tag; 32], node_type: NodeType::AccountState, content: vec![tag; 16] }
+        let content = vec![tag; 16];
+        let hash = sha512half(&content);
+        SHAMapNode { hash, node_type: NodeType::AccountState, content }
     }
 
     /// An inner node with a single child at `slot`, with its own hash correctly derived
