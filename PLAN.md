@@ -209,15 +209,15 @@ Lesson: determinism ≠ correctness — always verify against on-chain hashes.
   fields from `ledger.db`, independently recomputes `LedgerHash` (verified formula — see
   `serialize.rs::calculate_ledger_hash`), aborts on mismatch, and stores it in every `TxMap`
   entry. Verified on all 51 ledgers of the test range against real chain data.
-- ⬜ Per-delta replay: reconstructed `AccountSetHash` matches at every ledger
-      *(needs `xrla-import` replay path — Phase 1)*
+- ✅ Per-delta replay: `xrla-import` replays checkpoint + deltas, reconstructs each ledger's
+  `AccountSetHash`, and asserts it against the stored value. Run against a real 51-ledger
+  mainnet export/import round trip (4,500 txns, 27M+ state nodes) — every ledger passed.
 - ✅ Delta sizes measured and logged
 
 Still open in Phase 0:
-- Round-trip verification: replay checkpoint + deltas and confirm each reconstructed
-  `AccountSetHash` matches the on-chain value (needs `xrla-import`).
-- State leaf-content verification: recompute account-state leaf hashes (not just inner/root)
-  for full state coverage. (Transaction leaves are already fully verified via the tx-tree root.)
+- State leaf-content verification: recompute account-state (`AccountState`) *leaf* node
+  hashes, not just inner nodes — see Immediate TODOs item 7. (Inner-node hashes and
+  transaction leaves are both fully independently re-verified now.)
 
 **Why the per-ledger `LedgerHash` matters — chain-of-custody without full history.** Because
 `LedgerHash` embeds `parent_hash` (the previous ledger's hash), storing it for every ledger makes
@@ -326,3 +326,16 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
      nodes are IP-allowlisted (`secure_gateway`), not open like `s1`/`s2` — a genuinely
      independent second FH source for cross-checks would need a self-hosted FH node or a
      non-Ripple-operated public FH provider.
+
+7. **Leaf-node (`AccountState`) hash verification** — ✅ inner nodes done
+   (`xrla_common::state_tree::verify_inner_nodes`, wired into `xrla-import`'s replay path,
+   real-data-validated formula from Phase 0). Leaf/`AccountState` nodes are still
+   unimplemented: every state object's content is trusted against its NuDB-assigned hash
+   without independently recomputing it, unlike transactions (`tx_tree`) which already get
+   this treatment. Blocked on having a real NuDB snapshot to validate a candidate formula
+   against — public RPC (`ledger_data`/`ledger_entry`) exposes an object's data and ledger
+   index but not the internal SHAMap leaf-node hash, so this can't be confirmed without
+   direct file access to a real store, the same way the inner-node and tx-leaf formulas were
+   originally confirmed. Do not guess this formula and ship it as "verified" without that
+   validation step — a wrong formula would silently produce false confidence either way
+   (false passes or false failures).

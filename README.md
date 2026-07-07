@@ -59,13 +59,23 @@ on any mismatch instead of trusting the file. It then writes a real NuDB `.dat`/
 Validated so far: a synthetic 2-ledger chunk exercising the whole chain (including a
 deliberately-tampered `LedgerHash` being caught), plus ~200 real, rippled-produced node
 values sampled from a live mainnet shard round-tripped byte-for-byte through the new
-writer. **Not yet done**: running the writer's output through an actual rippled process, and
-a full multi-ledger round trip against real chain data (the populated `ledger.db` used
-earlier is no longer available in this environment — see TEST_PLAN.md).
+writer, and later a full real 51-ledger export → import round trip against a real mainnet
+NuDB snapshot (4,500 real transactions, 27M+ state nodes, every ledger's account_hash and
+chained LedgerHash independently verified). **Not yet done**: running the writer's output
+through an actual rippled process (see TEST_PLAN.md).
 
-Open: full real-data round trip through an actual rippled process, per-node state-leaf hash
-coverage (only the root is independently checked, not every intermediate inner node, on the
-import side), checkpoint sparsity across chunks (every `.xrla` file still bundles its own
+On import, every inner state-tree node's own hash is now independently recomputed from its
+raw content and checked against its claimed identity (`xrla_common::state_tree`) — not just
+the overall root. This is real-data-validated (the same formula confirmed in Phase 0 against
+7.9M real checkpoint inner nodes) and catches source-side corruption or decode bugs at any
+single node, not only ones large enough to shift the root.
+
+Open: **leaf-node (`AccountState`) hash coverage** — the formula needs the same
+real-NuDB-snapshot validation the inner-node and transaction formulas already got, and no
+such snapshot was available when this was last worked on (see PLAN.md "Immediate TODOs").
+Also open: automated checkpoint RPC anchoring (checking a chunk's first ledger against
+independent nodes, not just self-consistency), running the writer's output through an actual
+rippled process, checkpoint sparsity across chunks (every `.xrla` file still bundles its own
 full checkpoint — see DESIGN_NOTES.md), and validating the storage floor at scale. See
 PLAN.md. (A deterministic-but-wrong sparse-inner decode bug was caught here only by the
 on-chain hash check — determinism alone is not correctness.)

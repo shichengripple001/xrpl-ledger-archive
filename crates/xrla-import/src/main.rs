@@ -24,6 +24,7 @@ use clap::Parser;
 use xrla_common::chunk::{Chunk, TxMap};
 use xrla_common::serialize::{calculate_ledger_hash, deserialize_chunk, LedgerHashInput};
 use xrla_common::shamap::{Hash256, InnerNode, NodeType, SHAMapNode};
+use xrla_common::state_tree::verify_inner_nodes;
 use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
 
 #[derive(Parser, Debug)]
@@ -111,15 +112,23 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
     }
     if verify {
         verify_txns_authentic(cp)?;
+        if let Err(bad_hash) = verify_inner_nodes(&chunk.checkpoint) {
+            bail!(
+                "checkpoint: inner node {} does not hash to its own claimed content \
+                 (source data corruption or a decode bug)",
+                hex::encode(bad_hash)
+            );
+        }
     }
     let (_, nodes) = build_tx_tree(&cp.txns);
     tx_nodes.extend(nodes);
     if verify {
         println!(
-            "  ledger {} (checkpoint): account_hash OK, {} txns authentic \
-             (LedgerHash needs an external parent_hash anchor — not verified here)",
+            "  ledger {} (checkpoint): account_hash OK, {} txns authentic, {} inner nodes \
+             self-consistent (LedgerHash needs an external parent_hash anchor — not verified here)",
             cp.ledger_seq,
-            cp.txns.len()
+            cp.txns.len(),
+            chunk.checkpoint.iter().filter(|n| n.node_type == NodeType::Inner).count()
         );
     }
 
@@ -152,6 +161,15 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
         if verify {
             verify_txns_authentic(tx_map)?;
 
+            if let Err(bad_hash) = verify_inner_nodes(&delta.diff.added) {
+                bail!(
+                    "ledger {}: inner node {} does not hash to its own claimed content \
+                     (source data corruption or a decode bug)",
+                    tx_map.ledger_seq,
+                    hex::encode(bad_hash)
+                );
+            }
+
             if new_root != tx_map.account_hash {
                 bail!(
                     "ledger {}: replayed account root {} != stored account_hash {}",
@@ -181,9 +199,11 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
                 );
             }
             println!(
-                "  ledger {}: account_hash OK, {} txns authentic, LedgerHash OK (chained to parent)",
+                "  ledger {}: account_hash OK, {} txns authentic, {} inner nodes self-consistent, \
+                 LedgerHash OK (chained to parent)",
                 tx_map.ledger_seq,
-                tx_map.txns.len()
+                tx_map.txns.len(),
+                delta.diff.added.iter().filter(|n| n.node_type == NodeType::Inner).count()
             );
         }
 
