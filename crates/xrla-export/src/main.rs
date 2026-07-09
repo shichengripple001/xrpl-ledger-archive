@@ -7,6 +7,7 @@
 ///               --start 1000000 --end 1001000 \
 ///               --out ./chunks/
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,7 +17,7 @@ use rusqlite::{Connection, params};
 
 use xrla_common::chunk::{chunk_filename, Chunk, LedgerDelta, TxMap, NETWORK_MAINNET};
 use xrla_common::serialize::{calculate_ledger_hash, serialize_chunk, LedgerHashInput};
-use xrla_common::shamap::Hash256;
+use xrla_common::shamap::{Hash256, SHAMapNode};
 use xrla_nudb::NuDBReader;
 
 #[derive(Parser, Debug)]
@@ -46,13 +47,32 @@ struct Args {
     /// Network ID (1=mainnet, 2=testnet, 3=devnet)
     #[arg(long, default_value_t = NETWORK_MAINNET)]
     network_id: u32,
+
+    /// Ledgers per chunk (1 checkpoint + chunk_size-1 deltas). Only the very first chunk's
+    /// checkpoint costs a full NuDB trie walk — every chunk after that gets its checkpoint
+    /// by snapshotting the running in-memory state, not by re-reading NuDB. See PLAN.md
+    /// Phase 2 item 1.
+    #[arg(long, default_value_t = 10_000)]
+    chunk_size: u32,
 }
 
+/// Maintain-state-across-chunks export. Only the very first chunk's checkpoint costs a real
+/// NuDB trie walk (`collect_reachable_adaptive`); every chunk after that gets its checkpoint
+/// by snapshotting the running in-memory `state` map, which is kept alive and updated by each
+/// ledger's delta as the whole range is scanned forward once. See PLAN.md Phase 2 item 1 —
+/// this is what turns "one full trie walk per chunk" into "one full trie walk, ever."
+///
+/// Memory note: `state` holds every live SHAMap node for the entire export run — at today's
+/// mainnet scale that's ~27M nodes (~8 GB, see PLAN.md Storage Estimate). This is a known,
+/// accepted tradeoff of this design, not addressed here.
 fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.end <= args.start {
         bail!("--end must be greater than --start");
+    }
+    if args.chunk_size == 0 {
+        bail!("--chunk-size must be at least 1");
     }
 
     fs::create_dir_all(&args.out)?;
@@ -62,100 +82,219 @@ fn main() -> Result<()> {
     println!("Opening ledger index: {}", args.ledgers.display());
     let ledger_db = LedgerIndex::open(&args.ledgers)?;
 
-    println!("Exporting ledgers {}..{}", args.start, args.end);
-
-    // Checkpoint: full state at start_ledger
-    let start_info = ledger_db.get(args.start)?;
-    let start_ledger_hash = start_info.verify_ledger_hash(args.start)?;
     println!(
-        "Building checkpoint at ledger {} (state_hash={}, ledger_hash verified)...",
-        args.start,
-        hex::encode(start_info.account_hash)
+        "Exporting ledgers {}..{} in chunks of {} ledgers (one trie walk total, not one per chunk)",
+        args.start, args.end, args.chunk_size
     );
-    let checkpoint_nodes = nudb.collect_reachable(&start_info.account_hash)?;
-    println!("Checkpoint: {} nodes", checkpoint_nodes.len());
 
-    // TX map for start ledger (no delta, just transactions)
-    let start_txns = nudb
-        .collect_transactions(&start_info.tx_hash)
+    // The one and only full trie walk for the whole export run.
+    let first_info = ledger_db.get(args.start)?;
+    let first_ledger_hash = first_info.verify_ledger_hash(args.start)?;
+    println!(
+        "Building initial checkpoint at ledger {} (account_hash={})...",
+        args.start,
+        hex::encode(first_info.account_hash)
+    );
+    let walk_start = std::time::Instant::now();
+    // Calibrate once and reuse the same concurrency level for both the initial walk and
+    // batching delta computation below (diff_batch_concurrent) — one calibration, not two.
+    // See PLAN.md Immediate TODOs item 10b.
+    let concurrency = nudb.calibrate_concurrency(&first_info.account_hash)?;
+    let initial_nodes = nudb.collect_reachable_concurrent(&first_info.account_hash, concurrency)?;
+    println!(
+        "Initial checkpoint: {} nodes ({:.1}s, concurrency={})",
+        initial_nodes.len(),
+        walk_start.elapsed().as_secs_f64(),
+        concurrency
+    );
+
+    let mut state: HashMap<Hash256, SHAMapNode> =
+        initial_nodes.iter().map(|n| (n.hash, n.clone())).collect();
+
+    let first_txns = nudb
+        .collect_transactions(&first_info.tx_hash)
         .with_context(|| format!("tx collect failed at ledger {}", args.start))?;
-    let mut total_txns = start_txns.len();
-    let mut tx_maps = vec![TxMap {
+
+    let mut chunk_start = args.start;
+    let mut chunk_checkpoint_hash = first_ledger_hash;
+    let mut chunk_checkpoint_nodes = initial_nodes;
+    let mut chunk_deltas: Vec<LedgerDelta> = Vec::new();
+    let mut chunk_tx_maps: Vec<TxMap> = vec![TxMap {
         ledger_seq: args.start,
-        ledger_hash: start_ledger_hash,
-        account_hash: start_info.account_hash,
-        drops: start_info.total_coins,
-        parent_close_time: start_info.prev_closing_time,
-        close_time: start_info.closing_time,
-        close_time_resolution: start_info.close_time_resolution,
-        close_flags: start_info.close_flags,
-        txns: start_txns,
+        ledger_hash: first_ledger_hash,
+        account_hash: first_info.account_hash,
+        drops: first_info.total_coins,
+        parent_close_time: first_info.prev_closing_time,
+        close_time: first_info.closing_time,
+        close_time_resolution: first_info.close_time_resolution,
+        close_flags: first_info.close_flags,
+        txns: first_txns,
     }];
 
-    // Compute deltas
-    let mut deltas = Vec::new();
+    let mut prev_account_hash = first_info.account_hash;
+    let mut chunks_written = 0usize;
     let mut total_added = 0usize;
     let mut total_deleted = 0usize;
+    let mut total_txns = chunk_tx_maps[0].txns.len();
 
-    for seq in (args.start + 1)..=args.end {
-        let prev_info = ledger_db.get(seq - 1)?;
-        let curr_info = ledger_db.get(seq)?;
-        let curr_ledger_hash = curr_info.verify_ledger_hash(seq)?;
+    // Process ledgers in batches of up to `concurrency` at a time: fetch the batch's ledger
+    // info (cheap, local SQLite — unchanged), compute all their diffs CONCURRENTLY against
+    // NuDB (the actual bottleneck across a full-history export — see PLAN.md Immediate TODOs
+    // item 10b), then apply each diff to the running state IN ORDER. Discovery of what
+    // changed is parallel; applying it to `state` and writing chunks stays strictly
+    // sequential, since each ledger's starting state depends on the previous one already
+    // being applied.
+    let batch_size = concurrency.max(1) as u32;
+    let mut seq = args.start + 1;
+    while seq <= args.end {
+        let batch_end = (seq + batch_size - 1).min(args.end);
+        let batch_seqs: Vec<u32> = (seq..=batch_end).collect();
 
-        let diff = nudb
-            .diff(&prev_info.account_hash, &curr_info.account_hash)
-            .with_context(|| format!("diff failed at ledger {seq}"))?;
+        let batch_infos: Vec<LedgerInfo> = batch_seqs
+            .iter()
+            .map(|&s| ledger_db.get(s))
+            .collect::<Result<Vec<_>>>()?;
+        let batch_ledger_hashes: Vec<Hash256> = batch_infos
+            .iter()
+            .zip(&batch_seqs)
+            .map(|(info, &s)| info.verify_ledger_hash(s))
+            .collect::<Result<Vec<_>>>()?;
 
-        let txns = nudb
-            .collect_transactions(&curr_info.tx_hash)
-            .with_context(|| format!("tx collect failed at ledger {seq}"))?;
+        let mut pairs = Vec::with_capacity(batch_infos.len());
+        let mut running_prev = prev_account_hash;
+        for info in &batch_infos {
+            pairs.push((running_prev, info.account_hash));
+            running_prev = info.account_hash;
+        }
 
-        println!(
-            "  ledger {seq}: +{} -{} nodes ({} bytes), {} txns",
-            diff.added.len(),
-            diff.deleted.len(),
-            diff.added.iter().map(|n| n.content.len() + 33).sum::<usize>(),
-            txns.len()
-        );
+        let diffs = nudb
+            .diff_batch_concurrent(&pairs, concurrency)
+            .with_context(|| format!("batch diff failed for ledgers {seq}..={batch_end}"))?;
 
-        total_added += diff.added.len();
-        total_deleted += diff.deleted.len();
-        total_txns += txns.len();
+        for (i, diff) in diffs.into_iter().enumerate() {
+            let s = batch_seqs[i];
+            let curr_info = &batch_infos[i];
+            let curr_ledger_hash = batch_ledger_hashes[i];
 
-        deltas.push(LedgerDelta { ledger_seq: seq, diff });
-        tx_maps.push(TxMap {
-            ledger_seq: seq,
-            ledger_hash: curr_ledger_hash,
-            account_hash: curr_info.account_hash,
-            drops: curr_info.total_coins,
-            parent_close_time: curr_info.prev_closing_time,
-            close_time: curr_info.closing_time,
-            close_time_resolution: curr_info.close_time_resolution,
-            close_flags: curr_info.close_flags,
-            txns,
-        });
+            for node in &diff.added {
+                state.insert(node.hash, node.clone());
+            }
+            for hash in &diff.deleted {
+                state.remove(hash);
+            }
+
+            let txns = nudb
+                .collect_transactions(&curr_info.tx_hash)
+                .with_context(|| format!("tx collect failed at ledger {s}"))?;
+
+            println!(
+                "  ledger {s}: +{} -{} nodes ({} bytes), {} txns",
+                diff.added.len(),
+                diff.deleted.len(),
+                diff.added.iter().map(|n| n.content.len() + 33).sum::<usize>(),
+                txns.len()
+            );
+            total_added += diff.added.len();
+            total_deleted += diff.deleted.len();
+            total_txns += txns.len();
+
+            if s - chunk_start == args.chunk_size {
+                // Close out the just-finished chunk (its checkpoint + deltas accumulated so far).
+                write_chunk(
+                    &args,
+                    chunk_start,
+                    s - 1,
+                    chunk_checkpoint_hash,
+                    std::mem::take(&mut chunk_checkpoint_nodes),
+                    std::mem::take(&mut chunk_deltas),
+                    std::mem::take(&mut chunk_tx_maps),
+                )?;
+                chunks_written += 1;
+
+                // This ledger becomes the NEXT chunk's checkpoint ledger — its state is
+                // already in `state` (we just applied its diff above), so no NuDB walk needed.
+                chunk_start = s;
+                chunk_checkpoint_hash = curr_ledger_hash;
+                chunk_checkpoint_nodes = state.values().cloned().collect();
+                chunk_tx_maps.push(TxMap {
+                    ledger_seq: s,
+                    ledger_hash: curr_ledger_hash,
+                    account_hash: curr_info.account_hash,
+                    drops: curr_info.total_coins,
+                    parent_close_time: curr_info.prev_closing_time,
+                    close_time: curr_info.closing_time,
+                    close_time_resolution: curr_info.close_time_resolution,
+                    close_flags: curr_info.close_flags,
+                    txns,
+                });
+            } else {
+                chunk_deltas.push(LedgerDelta { ledger_seq: s, diff });
+                chunk_tx_maps.push(TxMap {
+                    ledger_seq: s,
+                    ledger_hash: curr_ledger_hash,
+                    account_hash: curr_info.account_hash,
+                    drops: curr_info.total_coins,
+                    parent_close_time: curr_info.prev_closing_time,
+                    close_time: curr_info.closing_time,
+                    close_time_resolution: curr_info.close_time_resolution,
+                    close_flags: curr_info.close_flags,
+                    txns,
+                });
+            }
+
+            prev_account_hash = curr_info.account_hash;
+        }
+
+        seq = batch_end + 1;
     }
+
+    // Final (possibly partial) chunk.
+    write_chunk(
+        &args,
+        chunk_start,
+        args.end,
+        chunk_checkpoint_hash,
+        chunk_checkpoint_nodes,
+        chunk_deltas,
+        chunk_tx_maps,
+    )?;
+    chunks_written += 1;
 
     let ledger_count = args.end - args.start;
     println!(
-        "Totals: +{total_added} -{total_deleted} nodes, {total_txns} txns across {ledger_count} ledgers \
-         (avg +{}/ledger)",
+        "\nTotals: {chunks_written} chunk(s), +{total_added} -{total_deleted} nodes, \
+         {total_txns} txns across {ledger_count} ledgers (avg +{}/ledger)",
         if ledger_count > 0 { total_added / ledger_count as usize } else { 0 }
     );
 
+    Ok(())
+}
+
+fn write_chunk(
+    args: &Args,
+    start_ledger: u32,
+    end_ledger: u32,
+    checkpoint_hash: Hash256,
+    checkpoint: Vec<SHAMapNode>,
+    deltas: Vec<LedgerDelta>,
+    tx_maps: Vec<TxMap>,
+) -> Result<()> {
+    let checkpoint_len = checkpoint.len();
+    let delta_count = deltas.len();
+
     let chunk = Chunk {
-        network_id:      args.network_id,
-        start_ledger:    args.start,
-        end_ledger:      args.end,
-        checkpoint_hash: start_info.ledger_hash,
-        chunk_hash:      [0u8; 32], // computed by serialize_chunk
-        checkpoint:      checkpoint_nodes,
+        network_id: args.network_id,
+        start_ledger,
+        end_ledger,
+        checkpoint_hash,
+        chunk_hash: [0u8; 32], // computed by serialize_chunk
+        checkpoint,
         deltas,
         tx_maps,
     };
 
     let bytes = serialize_chunk(&chunk)?;
-    let filename = chunk_filename(args.network_id, args.start, args.end);
+    let filename = chunk_filename(args.network_id, start_ledger, end_ledger);
     let out_path = args.out.join(&filename);
     fs::write(&out_path, &bytes)?;
 
@@ -164,9 +303,11 @@ fn main() -> Result<()> {
     let chunk_hash_hex = hex::encode(&bytes[49..81]);
 
     println!(
-        "\nWrote {} ({} bytes)\nchunk_hash: {}",
+        "Wrote {} ({} bytes, {} checkpoint nodes, {} deltas)\n  chunk_hash: {}",
         out_path.display(),
         bytes.len(),
+        checkpoint_len,
+        delta_count,
         chunk_hash_hex
     );
 
