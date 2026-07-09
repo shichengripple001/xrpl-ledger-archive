@@ -133,6 +133,47 @@ one) drops that to ~0.3 TB while keeping reconstruction bounded. Decide spacing 
 smaller historically), sum real deltas over a multi-million-ledger range, and confirm the floor
 against a full node's actual `.dat` size.
 
+### Full-history server evidence (2026-07-08)
+
+Found two real rippled full-history nodes (`devnet-fh-usw2-01`, `livenet-fh-usw2-01`) and inspected
+their on-disk layout directly:
+
+- **No `shard_db`, no `online_delete`.** Both run a single, permanently-growing `node_db` — one
+  `nudb.dat`/`nudb.key` pair covering the node's entire retained range, nothing ever purged. The
+  rippled shard store (fixed ~16,384-ledger immutable shards) is a separate, opt-in config these
+  full-history boxes aren't using. This invalidates any plan that assumes "just open the shard for
+  the ledger range you want" on mainnet full history — there is no shard boundary to target.
+- **Mainnet (`livenet-fh-usw2-01`) real sizes:** `nudb.dat` = 29,487,676,646,008 bytes (~29.5 TB),
+  `nudb.key` = 4,019,696,713,728 bytes (~4.0 TB). Combined ~33.5 TB, consistent with (and validating)
+  the ~25–30 TB state-node floor estimated above once transaction-tree nodes and NuDB overhead are
+  accounted for, and comfortably under the 39 TB full-node figure once `ledger.db`/`transaction.db`
+  are added on top.
+- **Derived total record count from the real key-file size** (no need to guess): NuDB's key file is
+  a hash table of fixed `block_size` (4096 B) buckets, capacity 227 entries/bucket at our
+  reverse-engineered format, target load factor 0.5 (see `xrla-nudb/src/keyfile.rs`,
+  `xrla-nudb/src/writer.rs`):
+  ```
+  num_buckets  = 4,019,696,713,728 / 4096              ≈ 981.4 million
+  total_entries ≈ num_buckets × 227 × load_factor       ≈ 55–111 billion   (range reflects
+                                                           uncertainty in average vs. target
+                                                           load factor under linear-hashing growth)
+  ```
+  This is the **total unique (state + transaction-tree) node count across all of mainnet history**,
+  measured indirectly from real on-disk evidence, not extrapolated from a per-ledger rate. It is a
+  more trustworthy total-workload number than multiplying today's measured per-ledger delta rate
+  (~1,966 changed state nodes/ledger, see above) across all 105M+ ledgers, because both state size
+  and transaction volume grew dramatically over the network's lifetime — a recent-ledger rate applied
+  uniformly to early history overestimates old ledgers' cost the same way today's 27M-node checkpoint
+  size overestimates early-history checkpoint size.
+- **NuDB lookup is genuinely O(1) w.r.t. store size** — benchmarked, not assumed. See
+  `crates/xrla-nudb/examples/bench_lookup.rs`: builds real, structurally valid NuDB stores (via
+  `write_nudb_store`) from 1,000 to 5,000,000 entries (5000× range, key file 40 KB → 180 MB) and
+  times `Shard::fetch` for a fixed probe set against each. Result: flat ~1.0–1.4 µs/lookup across
+  the entire range, no growth trend — confirms the bucket-hash-then-single-read mechanism doesn't
+  degrade with size. **Caveat:** this ran cache-warm on local SSD; it doesn't measure real cold-read
+  latency against an actual multi-TB key file that can't fit in RAM (that requires running against
+  a real full-history box — not yet done).
+
 ---
 
 ## Project Structure
@@ -236,9 +277,103 @@ blockchain. See `spec/chunk-format.md` "Verification without full history."
 
 ### Phase 2: Full history export
 
-- Scale to all 90M ledgers (parallel workers per non-overlapping range)
-- Measure actual total size vs 16 TB estimate
-- Performance target: export full history in < 48 hours
+**The `< 48 hours` target below is not yet validated, though the two blocking architectural
+changes are now implemented.** `xrla-export` used to re-walk the full account-state trie from
+scratch (`NuDBReader::collect_reachable`) for every chunk's checkpoint. Against a real
+full-history node's total workload (~55–111 billion node touches across history — see
+"Full-history server evidence" above) that was years, not hours, even before accounting for
+cold-storage I/O. Two architectural changes were required before Phase 2 is realistic, plus a
+third for operational safety over a multi-day run:
+
+1. **Maintain live state across the whole export run, not per chunk.** ✅ done and
+   **validated end-to-end against real data (2026-07-08)**. `xrla-export` keeps one running
+   `HashMap<Hash256, SHAMapNode>` alive for the entire export (see `--chunk-size`, default
+   10,000 ledgers). Each ledger's delta is applied to it as the range is scanned forward; at a
+   chunk boundary, the current in-memory map is serialized as that chunk's checkpoint
+   (`write_chunk` helper) instead of calling `collect_reachable` again. This reduces the number
+   of full trie walks for the entire export from ~1 per chunk to **one, total**.
+
+   Validation run: real mainnet NuDB snapshot (ledgers 105277428–105277528, 100 ledgers),
+   `--chunk-size 30` → 4 chunks (30/30/30/11 ledgers). Log confirms exactly one
+   `"Initial checkpoint"` line for the whole run (27,031,655 nodes, 77.5s — matching the earlier
+   serial-walk baseline, now under the safety-capped concurrency from item 2). All three later
+   chunks' checkpoints came from the in-memory snapshot with no further NuDB walk. Verified with
+   `xrla-import` against both the first chunk (whose checkpoint came from the real walk) and the
+   last, partial chunk (whose checkpoint came from the in-memory snapshot, and which also
+   exercises the shorter-final-chunk edge case): every ledger's account_hash, chained LedgerHash,
+   transaction authenticity, and full state-tree self-consistency (27M+ nodes each) passed with
+   no failures. This is the first real-data validation of the multi-chunk architecture — the
+   prior attempt was the run that caused the item-2 I/O incident and never completed.
+
+2. **Concurrent/batched NuDB reads — adaptive, not a fixed constant.** ✅ done for
+   `collect_reachable` (2026-07-08); ✅ also done for the per-ledger delta computation
+   (2026-07-09, `feat/concurrent-diff-batching` branch, not yet merged to `main`) — see
+   Immediate TODOs item 10b for full detail, including an honest **no speedup observed
+   locally** finding.
+   `NuDBReader::collect_reachable` used to fetch one node at a time, fully serially — each blocked
+   on disk before the next was issued, leaving most of an NVMe drive's real IOPS capacity unused
+   (single-threaded ~16K IOPS from ~60µs latency vs. ~100–200K+ IOPS achievable at real queue
+   depth). Fixed by `collect_reachable_concurrent` (level-by-level BFS, fetches an entire frontier
+   concurrently via a `rayon` thread pool before computing the next) plus `calibrate_concurrency` /
+   `collect_reachable_adaptive`, which self-tune the in-flight count at runtime instead of using a
+   hardcoded constant. `xrla-export` now calls `collect_reachable_adaptive` for its checkpoint
+   walk. Correctness verified: `collect_reachable_concurrent` at concurrency 1/2/4/8, plus the
+   adaptive path, all produce the identical node set as the original serial walk against a real
+   multi-level test tree (`xrla-nudb/src/reader.rs::concurrent_walk_matches_serial_walk`).
+
+   **2026-07-08 incident and fix.** The first version of this calibrated by climbing a hardcoded
+   `[1, 4, 16, 64, 256]` ladder against the real target store, optimizing purely for the
+   benchmark's own throughput. Run against two real ~6 GB files sitting on a laptop's single
+   shared disk, 256 concurrent threads saturated I/O badly enough to make the whole machine
+   unresponsive, requiring a hard restart. Root cause: "adaptive" meant "tuned for maximum
+   throughput," not "safe to run here" — the calibration climbed by *live-testing* each level
+   (so a dangerous level got a real trial run before anything could rule it out), used a relative
+   "did throughput plateau" stopping rule with no absolute latency ceiling, and had no concept of
+   whether the target disk was shared with the OS or genuinely dedicated. Fixed in
+   `NuDBReader::calibrate_concurrency` / `shares_device_with_os_root`
+   (`crates/xrla-nudb/src/reader.rs`, `crates/xrla-nudb/src/keyfile.rs::Shard::dat_device`):
+   - Device detection (`st_dev` of the target `.dat` file vs. the OS root filesystem, fail-safe
+     to "shared" if undetectable) selects the ladder: `[1, 2, 4, 8, 16, 32]` on dedicated storage,
+     `[1, 2, 4]` when sharing a disk with the OS — nowhere near the old flat `256` ceiling either way.
+   - An absolute per-request latency ceiling (50ms) aborts the climb immediately on real queueing,
+     not just once *relative* throughput gain drops off — by the time a relative metric notices,
+     damage to the rest of the machine may already be underway.
+   - Regression test `calibration_never_exceeds_the_given_ladder` locks this in: calibration must
+     always return a level from the exact ladder it was given.
+
+   **Not yet done**: a continuous AIMD feedback loop that re-adapts mid-run (the current design
+   only calibrates once, at the start of a walk); real-world speedup and the safe ceiling on real
+   full-history *dedicated* hardware are still unmeasured (depends on item 8) — this incident was
+   on a shared laptop disk, not the target production environment, so item 8 must run somewhere
+   dedicated, never on anyone's daily-driver machine.
+
+3. **Resumability**, a natural consequence of (1): a completed chunk file already contains its own
+   full checkpoint (`Chunk.checkpoint`), and `deserialize_chunk` already verifies `chunk_hash` on
+   read. On restart after a crash/interruption, load the *last complete, hash-verified* chunk's own
+   checkpoint back into the in-memory state map (a local file read, no NuDB access) and resume delta
+   processing forward from there — discarding only the in-progress chunk. This bounds lost work on
+   a mid-export failure to one chunk's worth of (cheap) delta replay, never a repeat of the
+   expensive one-time trie walk. Not implemented.
+
+**Paper estimates** (real key-file-derived total of ~55–111 billion node touches, 3 physical reads
+per node — bucket + dat header + dat value — instance-store NVMe, unmeasured against the real box):
+
+| Configuration | Estimated total time |
+|---|---|
+| Current (re-walk per chunk, serial reads) | years — not viable |
+| + maintain-state fix only (serial reads) | ~4–8 months |
+| + maintain-state fix + concurrency (both fixes) | ~10–40 days |
+
+These are order-of-magnitude estimates from known hardware classes and small-scale benchmarks, not
+measurements. The only way to firm them up is running the real workload (or a timed raw-lookup loop)
+against an actual full-history box.
+
+- Scale to all 90M+ ledgers (parallel workers per non-overlapping range remains viable *in addition*
+  to the above — e.g. one maintain-state worker per large sub-range)
+- Measure actual total size vs the ~25–30 TB state-node floor estimate (partially validated above
+  via real `nudb.dat`+`nudb.key` sizes; still need the tx-tree-node share broken out)
+- Revised performance target: get a real, measured number for one maintain-state + concurrent
+  worker against a real full-history box before committing to a multi-day full-history export plan
 
 ### Phase 3: Distribution
 
@@ -339,3 +474,95 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
    `xrla_common::state_tree::verify_state_nodes` (covers both inner and leaf nodes now) and
    wired into `xrla-import`'s replay path; real-data-gated regression test at
    `xrla-nudb/src/reader.rs::real_snapshot_state_nodes_self_verify`.
+
+8. **Real cold-read latency benchmark against an actual full-history NuDB.** The synthetic
+   benchmark (`crates/xrla-nudb/examples/bench_lookup.rs`) proved the lookup *algorithm* is
+   O(1) up to a 180 MB key file, cache-warm on local SSD. It does not measure real latency
+   against a genuinely multi-TB key file that can't fit in RAM (a real full-history box, e.g.
+   `livenet-fh-usw2-01`'s 4.0 TB `nudb.key`). Needs a timed raw `NuDBReader::get_node` loop run
+   directly against real full-history hardware (read-only, no export/write side effects) to
+   replace the current 50–150µs/read paper estimate with a measured number. **Must run on
+   dedicated hardware only** — see the 2026-07-08 incident under Phase 2 item 2: a concurrency
+   experiment on a shared laptop disk saturated I/O badly enough to require a hard restart.
+   Never run concurrency/throughput experiments against a daily-driver machine's disk again.
+   **Now also the sole blocker for validating item 10b's speed benefit** — the local test there
+   showed no speedup (page-cache-warm data has no I/O latency for concurrency to hide), so this
+   benchmark is the only way to find out whether the concurrent-diff-batching work helps at all
+   on real, cold, dedicated storage.
+
+9. **Maintain-state-across-chunks export architecture** — ✅ done and validated end-to-end
+   against real data (2026-07-08). See Phase 2 item 1 for the full validation run detail:
+   `xrla-export` now performs exactly one full trie walk per invocation (via
+   `collect_reachable_adaptive`), regardless of how many chunks the requested range spans.
+   Added `--chunk-size` (default 10,000 ledgers); the export loop maintains a running
+   `HashMap<Hash256, SHAMapNode>` across the whole run, applies each ledger's delta to it, and
+   at every chunk boundary snapshots the current map as that chunk's checkpoint (`write_chunk`
+   helper) instead of re-walking NuDB. Only the very first chunk's checkpoint costs a real walk.
+   Real-data run: 100 real mainnet ledgers, `--chunk-size 30` → 4 chunks, exactly one trie walk
+   logged, all 4 chunks written; `xrla-import` verified the first chunk (real-walk checkpoint)
+   and the last, partial chunk (in-memory-snapshot checkpoint, shorter-final-chunk edge case) —
+   every account_hash, chained LedgerHash, and state-tree self-consistency check passed.
+
+10a. **Concurrent/batched NuDB reads for `collect_reachable`, adaptive concurrency** — ✅ done
+    (2026-07-08), **hardened same day after an I/O-saturation incident** — see Phase 2 item 2 for
+    full detail. Added `NuDBReader::collect_reachable_concurrent` (level-by-level BFS walk,
+    fetches an entire frontier via a `rayon` thread pool instead of one node at a time),
+    `calibrate_concurrency` / `calibrate_concurrency_with_levels` (startup probe against the real
+    store; ladder and absolute-latency circuit breaker chosen based on whether the target shares
+    a disk with the OS — see `shares_device_with_os_root`), and `collect_reachable_adaptive`
+    (calibrate then walk) as the entry point `xrla-export` now calls for its checkpoint walk.
+    Correctness tested against the original serial walk at multiple concurrency levels on a real
+    multi-level tree — identical node sets; a dedicated regression test
+    (`calibration_never_exceeds_the_given_ladder`) locks in that calibration can never exceed
+    the ladder it's given. Added `rayon` as a workspace dependency. Real-world speedup on real
+    (dedicated) full-history hardware is still unmeasured (depends on item 8); the calibration
+    is one-shot at walk start, not a continuous feedback loop (see item 11).
+
+10b. **Concurrent/batched delta computation across many ledgers** — ✅ implemented and
+    correctness-validated (2026-07-09, branch `feat/concurrent-diff-batching`, **not yet
+    merged to `main`**). Took approach (b) from the original plan below: rather than
+    parallelizing inside one ledger's `diff_nodes` recursion (which mutates a shared
+    `&mut SHAMapDiff` and doesn't fit 10a's level-by-level shape), added
+    `NuDBReader::diff_batch_concurrent(pairs, concurrency)` — since every ledger's
+    `(old_root, new_root)` pair is known upfront from `ledger.db`, it runs `diff()` for many
+    ledgers concurrently via the same `rayon` thread-pool pattern as `collect_reachable_concurrent`,
+    reusing the *same* calibrated concurrency level (no new calibration, no new safety surface).
+    `xrla-export`'s main loop now processes ledgers in batches of `concurrency` size: discovery
+    (the diffs) happens in parallel, application to the running `state` map stays strictly
+    sequential (each ledger's starting state depends on the previous one already being applied).
+
+    **Correctness**: strong evidence, not just a unit test. Synthetic test
+    (`diff_batch_concurrent_matches_serial`) confirms batched and serial results match at
+    concurrency 1/2/4 on a small multi-version tree. More importantly, a real 500-ledger export
+    (105277428–105277928) run twice — once batched, once with concurrency forced to 1 — produced
+    **byte-identical `chunk_hash`** (`de734d235a4acf...`) and identical totals (1,043,162 added
+    nodes, 46,064 real transactions) either way.
+
+    **Honest speed finding: no local speedup observed — likely correct, not a red flag.**
+    Three real timed runs on the same 500-ledger range (checkpoint-walk time excluded, only the
+    delta-processing loop compared): batched-cold ~56.6s, serial-warm ~26.3s, batched-warm
+    ~48.2s. Batched was *slower* even under the most cache-favorable conditions tested. Read as:
+    concurrency only pays off when there's real disk latency to hide (the whole premise from the
+    `bench_lookup` synthetic benchmark); on this small, page-cache-warm local dataset each
+    `diff()` call is already fast (low milliseconds), so thread-pool coordination overhead
+    exceeds any latency saved. This does not indicate a design flaw — it reinforces that the
+    real validation can only come from item 8's genuinely-cold, dedicated-hardware benchmark,
+    not a local warm-cache test. Do not claim a speed benefit until that measurement exists.
+
+    Original plan for reference: (a) restructure `diff_nodes`' recursion into a fork-join over
+    the 16 child slots with independent per-branch diffs merged at the end, or (b) the coarser,
+    higher-leverage win of running `diff()` for many *ledgers* concurrently instead of
+    parallelizing inside one ledger's (typically small, ~2,000-node) diff — (b) is what got built.
+
+11. **Continuous AIMD feedback loop for concurrency** — not started, follow-up to 10a. The
+    current calibration is one-shot at the start of a walk; a continuous loop (track rolling
+    p50/p99 latency over a sliding window, increase in-flight count while throughput climbs, back
+    off multiplicatively when latency spikes — same idea as TCP congestion control) would also
+    re-adapt if conditions change mid-run (e.g. other processes start competing for I/O on the
+    box), which a one-time calibration pass misses.
+
+12. **Export resumability** — see Phase 2 item 3. Depends on (9). On startup, detect the last
+    complete, `chunk_hash`-verified chunk file, load its own checkpoint back into the in-memory
+    state map (local read, no NuDB access), and resume delta processing forward from there,
+    discarding any partially-written chunk. Bounds lost work on a mid-export crash/interruption
+    to one chunk's delta-replay cost, not a repeat of the full trie walk. Not started.

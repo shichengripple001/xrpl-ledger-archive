@@ -30,14 +30,24 @@ See [PLAN.md](PLAN.md) for the design, [DESIGN_NOTES.md](DESIGN_NOTES.md) for th
 
 ```bash
 cargo build --release
+export PATH="$(pwd)/target/release:$PATH"
 
 # Export a ledger range from a (stopped) rippled NuDB snapshot.
 # Pass every online_delete shard's .dat — each needs a sibling nudb.key; state spans both.
-./target/release/xrla-export \
+# --chunk-size controls ledgers per chunk (default 10,000); only the first chunk in the
+# whole run costs a full trie walk, every later chunk snapshots the running in-memory state.
+xrla-export \
   --dat /snap/shard0/nudb.dat /snap/shard1/nudb.dat \
   --ledgers /snap/ledger.db \
   --start 105277428 --end 105277478 \
+  --chunk-size 10000 \
   --out ./chunks/
+
+# Inspect a chunk without importing it — summary, per-ledger detail, or a specific
+# transaction by index or directly by hash (no need to know which ledger it's in).
+xrla-inspect --chunk ./chunks/xrla_1_0105277428_0105277478.xrla
+xrla-inspect --chunk ./chunks/xrla_1_0105277428_0105277478.xrla --ledger 105277430
+xrla-inspect --chunk ./chunks/xrla_1_0105277428_0105277478.xrla --tx-hash <64-char hex tx hash>
 ```
 
 ## Status
@@ -77,3 +87,23 @@ rippled process, checkpoint sparsity across chunks (every `.xrla` file still bun
 full checkpoint — see DESIGN_NOTES.md), and validating the storage floor at scale. See
 PLAN.md. (A deterministic-but-wrong sparse-inner decode bug was caught here only by the
 on-chain hash check — determinism alone is not correctness.)
+
+**Full-history export at scale: the two blocking architectural changes are now implemented and
+validated against real data at small scale; unmeasured at full-history scale.** Real full-history
+rippled nodes inspected directly (`livenet-fh-usw2-01`): a single, permanently growing
+`nudb.dat`/`nudb.key` pair (no shard store, no `online_delete`), 29.5 TB / 4.0 TB. Deriving total
+record count from the real key-file size gives ~55–111 billion node touches across mainnet
+history — the real total workload for a full export, not a guess. `NuDBReader`'s lookup mechanism
+is confirmed genuinely O(1) with store size (benchmarked up to a 180 MB key file, see
+`crates/xrla-nudb/examples/bench_lookup.rs`). `xrla-export` now (1) maintains one running state
+map across the whole export instead of re-walking per chunk (cuts full trie walks from ~1/chunk
+to 1 total) and (2) issues concurrent, self-calibrating NuDB reads instead of one blocking read
+at a time. **2026-07-08 incident and fix**: the first version of the concurrency calibration
+saturated a laptop's shared disk badly enough to require a hard restart — fixed with a
+same-disk-detection safety ceiling and an absolute-latency circuit breaker (see PLAN.md Phase 2
+item 2). With the fix in place, both changes were then validated end-to-end against 100 real
+mainnet ledgers (`--chunk-size 30` → 4 chunks): exactly one trie walk for the whole run, every
+chunk `xrla-import`-verified (account_hash, chained LedgerHash, full state-tree self-consistency
+over 27M+ nodes each) with no failures. Paper estimate for full mainnet scale with both changes:
+~10–40 days; still unmeasured at that scale, and any such testing must run on dedicated storage,
+never a daily-driver machine. See PLAN.md Phase 2 and Immediate TODOs 8–11.
