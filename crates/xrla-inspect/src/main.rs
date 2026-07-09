@@ -4,6 +4,7 @@
 ///   xrla-inspect --chunk ./chunks/xrla_1_0105277428_0105277478.xrla
 ///   xrla-inspect --chunk ... --ledger 105277430
 ///   xrla-inspect --chunk ... --ledger 105277430 --tx 0
+///   xrla-inspect --chunk ... --tx-hash 010D3CA6...   (no --ledger needed — searches the whole chunk)
 
 use std::fs;
 use std::path::PathBuf;
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
+use xrla_common::chunk::TxRecord;
 use xrla_common::serialize::deserialize_chunk;
 
 #[derive(Parser, Debug)]
@@ -27,6 +29,11 @@ struct Args {
     /// With --ledger, show the raw blob/meta hex for one transaction by index
     #[arg(long)]
     tx: Option<usize>,
+
+    /// Look up one transaction anywhere in the chunk by its hash (hex, case-insensitive) —
+    /// searches every ledger in the chunk, no --ledger needed
+    #[arg(long)]
+    tx_hash: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -38,11 +45,15 @@ fn main() -> Result<()> {
 
     let chunk = deserialize_chunk(&data).context("parsing chunk")?;
 
-    match (args.ledger, args.tx) {
-        (None, None) => print_summary(&chunk),
-        (Some(seq), None) => print_ledger(&chunk, seq)?,
-        (Some(seq), Some(tx_idx)) => print_tx(&chunk, seq, tx_idx)?,
-        (None, Some(_)) => bail!("--tx requires --ledger"),
+    if let Some(hash_hex) = &args.tx_hash {
+        print_tx_by_hash(&chunk, hash_hex)?;
+    } else {
+        match (args.ledger, args.tx) {
+            (None, None) => print_summary(&chunk),
+            (Some(seq), None) => print_ledger(&chunk, seq)?,
+            (Some(seq), Some(tx_idx)) => print_tx(&chunk, seq, tx_idx)?,
+            (None, Some(_)) => bail!("--tx requires --ledger (or use --tx-hash to look up by hash directly)"),
+        }
     }
 
     Ok(())
@@ -122,11 +133,44 @@ fn print_tx(chunk: &xrla_common::chunk::Chunk, seq: u32, tx_idx: usize) -> Resul
         .get(tx_idx)
         .with_context(|| format!("ledger {seq} has no transaction at index {tx_idx}"))?;
 
+    print_tx_detail(tx);
+    Ok(())
+}
+
+/// Search every ledger in the chunk for a transaction matching `hash_hex`, independent of
+/// which ledger it happens to be in — useful when you have a tx hash but not its ledger.
+fn print_tx_by_hash(chunk: &xrla_common::chunk::Chunk, hash_hex: &str) -> Result<()> {
+    let target = parse_hash(hash_hex)?;
+    for tx_map in &chunk.tx_maps {
+        if let Some(tx) = tx_map.txns.iter().find(|t| t.tx_hash == target) {
+            println!("found in ledger: {}", tx_map.ledger_seq);
+            print_tx_detail(tx);
+            return Ok(());
+        }
+    }
+    bail!(
+        "transaction {} not found in this chunk (ledgers {}..={})",
+        hash_hex.to_uppercase(),
+        chunk.start_ledger,
+        chunk.end_ledger
+    )
+}
+
+fn print_tx_detail(tx: &TxRecord) {
     println!("tx_hash:   {}", hex::encode_upper(tx.tx_hash));
     println!("tx_blob ({} bytes, rippled binary serialization):", tx.tx_blob.len());
     println!("{}", hex::encode(&tx.tx_blob));
     println!();
     println!("meta_blob ({} bytes, rippled binary serialization):", tx.meta_blob.len());
     println!("{}", hex::encode(&tx.meta_blob));
-    Ok(())
+}
+
+fn parse_hash(s: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(s.trim()).with_context(|| format!("invalid hex string: {s}"))?;
+    if bytes.len() != 32 {
+        bail!("expected 32-byte hash, got {} bytes from '{}'", bytes.len(), s);
+    }
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&bytes);
+    Ok(h)
 }
