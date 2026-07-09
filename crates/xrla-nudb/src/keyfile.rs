@@ -106,6 +106,16 @@ impl Shard {
         Ok(Self { dat, key, salt, block_size, num_buckets, modulus })
     }
 
+    /// Device ID (`st_dev`) of the underlying `.dat` file's filesystem — used to detect
+    /// whether this store shares a physical disk with the OS (e.g. a laptop's boot volume).
+    /// See `NuDBReader::shares_device_with_os_root` and the 2026-07-08 incident notes there:
+    /// running heavy concurrent I/O against a shared disk saturated it badly enough to make
+    /// the whole machine unresponsive, requiring a hard restart.
+    pub(crate) fn dat_device(&self) -> Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(self.dat.metadata()?.dev())
+    }
+
     fn bucket_index(&self, nhash: u64) -> u64 {
         let mut n = nhash % self.modulus;
         if n >= self.num_buckets {

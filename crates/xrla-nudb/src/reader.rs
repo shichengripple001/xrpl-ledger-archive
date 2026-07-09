@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use rayon::prelude::*;
 
 use xrla_common::chunk::TxRecord;
 use xrla_common::shamap::{Hash256, InnerNode, SHAMapDiff, SHAMapNode, ZERO_HASH};
@@ -88,6 +89,208 @@ impl NuDBReader {
         Ok(result)
     }
 
+    /// Collect all nodes reachable from root_hash, fetching each BFS level's nodes
+    /// concurrently via a dedicated thread pool of `concurrency` workers. Falls back to the
+    /// plain serial `collect_reachable` when `concurrency <= 1`.
+    ///
+    /// Correctness is identical to `collect_reachable`: a hash is only ever added to a
+    /// frontier once (deduped via `visited` before insertion), so every unique node is
+    /// fetched exactly once and appears exactly once in the result — only the fetch
+    /// order/parallelism differs. See PLAN.md Phase 2 item 2.
+    pub fn collect_reachable_concurrent(
+        &self,
+        root_hash: &Hash256,
+        concurrency: usize,
+    ) -> Result<Vec<SHAMapNode>> {
+        if concurrency <= 1 {
+            return self.collect_reachable(root_hash);
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .context("build concurrent NuDB fetch thread pool")?;
+
+        let mut result = Vec::new();
+        let mut visited: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
+        visited.insert(*root_hash);
+        let mut frontier = vec![*root_hash];
+
+        while !frontier.is_empty() {
+            let fetched: Vec<Result<SHAMapNode>> =
+                pool.install(|| frontier.par_iter().map(|h| self.get_node(h)).collect());
+
+            let mut next_frontier = Vec::new();
+            for node_result in fetched {
+                let node = node_result?;
+                if node.node_type.is_inner() {
+                    let inner = InnerNode::from_node(&node).map_err(|e| anyhow::anyhow!("{e}"))?;
+                    for child_hash in inner.child_hashes() {
+                        if visited.insert(*child_hash) {
+                            next_frontier.push(*child_hash);
+                        }
+                    }
+                }
+                result.push(node);
+            }
+            frontier = next_frontier;
+        }
+
+        Ok(result)
+    }
+
+    /// True if any open shard's `.dat` file shares a physical device with the OS root
+    /// filesystem (e.g. a laptop's single boot disk), vs. genuinely dedicated storage (real
+    /// full-history server instance-store NVMe). Fails safe: if device IDs can't be read for
+    /// any reason, treated as shared.
+    ///
+    /// **2026-07-08 incident**: `calibrate_concurrency` climbed to 256 concurrent threads
+    /// against two real ~6 GB files sitting on a laptop's single shared disk. The resulting
+    /// I/O saturation made the whole machine unresponsive badly enough to require a hard
+    /// restart — the calibration logic optimized purely for *this benchmark's own*
+    /// throughput and had no concept of the cost imposed on every other process sharing that
+    /// disk. This check exists so a shared-disk environment gets a hard, low concurrency
+    /// ceiling regardless of what calibration would otherwise pick.
+    fn shares_device_with_os_root(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let root_dev = match std::fs::metadata("/") {
+            Ok(m) => m.dev(),
+            Err(_) => return true, // can't tell — fail safe
+        };
+        self.shards.iter().any(|s| match s.dat_device() {
+            Ok(d) => d == root_dev,
+            Err(_) => true, // can't tell this shard — fail safe
+        })
+    }
+
+    /// Probe the real store to pick a concurrency level for `collect_reachable_concurrent`,
+    /// instead of hardcoding one that may be wrong for the actual hardware (see PLAN.md
+    /// Phase 2 item 2 — the right level depends on real, unmeasured-per-box NVMe
+    /// characteristics). Samples a bounded set of real hashes near `root_hash`, then times
+    /// fetching them at increasing concurrency levels, stopping once additional concurrency
+    /// stops meaningfully improving throughput OR once latency indicates real queueing (see
+    /// `calibrate_concurrency_with_levels`). Safe by default: the concurrency ceiling is far
+    /// lower, and reached far more cautiously, when the target store shares a disk with the
+    /// OS — see `shares_device_with_os_root` and its incident notes.
+    pub fn calibrate_concurrency(&self, root_hash: &Hash256) -> Result<usize> {
+        // Ladders start small and climb one step at a time — unlike the pre-incident version,
+        // which jumped straight to hardcoded [1, 4, 16, 64, 256] regardless of hardware, a
+        // dangerous level got a live trial run before anything could rule it out. Max ceiling
+        // is now 32 (dedicated) or 4 (shared) — nowhere near the old 256.
+        const DEDICATED_LEVELS: &[usize] = &[1, 2, 4, 8, 16, 32];
+        const SHARED_DISK_LEVELS: &[usize] = &[1, 2, 4];
+
+        let levels = if self.shares_device_with_os_root() {
+            SHARED_DISK_LEVELS
+        } else {
+            DEDICATED_LEVELS
+        };
+        self.calibrate_concurrency_with_levels(root_hash, levels)
+    }
+
+    /// Core calibration logic, parameterized on the ladder to climb — split out from
+    /// `calibrate_concurrency` so tests can exercise it deterministically without depending
+    /// on real device detection.
+    fn calibrate_concurrency_with_levels(&self, root_hash: &Hash256, levels: &[usize]) -> Result<usize> {
+        const SAMPLE_SIZE: usize = 2048;
+        const MIN_GAIN: f64 = 1.15; // require >=15% throughput improvement to keep climbing
+        // Absolute per-request latency ceiling: real NVMe/SSD random reads are sub-millisecond.
+        // 50ms average means genuine queueing/contention, not just "a bit slower" — abort the
+        // ladder immediately rather than only reacting once the *relative* throughput gain
+        // stops looking good, since by then damage to the rest of the machine may already be
+        // underway (see `shares_device_with_os_root` incident notes).
+        const ABORT_LATENCY_SECS: f64 = 0.05;
+
+        let min_sample = levels.get(1).copied().unwrap_or(1);
+        let sample = self.sample_hashes(root_hash, SAMPLE_SIZE)?;
+        if sample.len() < min_sample {
+            // Not enough real data to calibrate meaningfully (e.g. a tiny tree) — serial
+            // is a safe, correct default.
+            return Ok(1);
+        }
+
+        let mut best_level = 1;
+        let mut best_throughput = 0.0f64;
+
+        for &level in levels {
+            if level > sample.len() {
+                break;
+            }
+            // Bounded probe size regardless of level — even the top of the ladder only ever
+            // issues a small, short-lived burst of reads during calibration.
+            let probe_size = (level * 4).clamp(1, 128).min(sample.len());
+            let probe: Vec<Hash256> = sample.iter().take(probe_size).cloned().collect();
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(level)
+                .build()
+                .context("build calibration thread pool")?;
+
+            let start = std::time::Instant::now();
+            pool.install(|| {
+                probe.par_iter().for_each(|h| {
+                    let _ = self.get_node(h);
+                });
+            });
+            let elapsed = start.elapsed().as_secs_f64().max(1e-9);
+            let avg_latency = elapsed / probe.len() as f64;
+            let throughput = probe.len() as f64 / elapsed;
+
+            if avg_latency > ABORT_LATENCY_SECS {
+                // Real queueing detected at this level — don't trust its throughput number
+                // (it can look fine in isolation while still hurting the rest of the
+                // machine) and don't climb any further. Keep the last known-safe level.
+                break;
+            }
+
+            if level == levels[0] || throughput > best_throughput * MIN_GAIN {
+                best_throughput = throughput;
+                best_level = level;
+            } else {
+                break; // marginal gain — past the knee, stop climbing
+            }
+        }
+
+        Ok(best_level)
+    }
+
+    /// Walk the full reachable set from `root_hash`, self-tuning concurrency by probing the
+    /// real store first (`calibrate_concurrency`) rather than using a fixed, hardcoded
+    /// in-flight count. Safe by default: calibration climbs cautiously and is hard-capped
+    /// much lower when the target shares a disk with the OS (see `shares_device_with_os_root`).
+    /// This is the entry point production callers (e.g. `xrla-export`) should use.
+    pub fn collect_reachable_adaptive(&self, root_hash: &Hash256) -> Result<Vec<SHAMapNode>> {
+        let concurrency = self.calibrate_concurrency(root_hash)?;
+        self.collect_reachable_concurrent(root_hash, concurrency)
+    }
+
+    /// Gather up to `target` real, distinct node hashes reachable from `root_hash` via a
+    /// bounded sequential walk — used to build a representative probe set for
+    /// `calibrate_concurrency` without paying for a full walk first.
+    fn sample_hashes(&self, root_hash: &Hash256, target: usize) -> Result<Vec<Hash256>> {
+        let mut result = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        visited.insert(*root_hash);
+        let mut stack = vec![*root_hash];
+
+        while let Some(hash) = stack.pop() {
+            if result.len() >= target {
+                break;
+            }
+            let node = self.get_node(&hash)?;
+            result.push(hash);
+            if node.node_type.is_inner() {
+                let inner = InnerNode::from_node(&node).map_err(|e| anyhow::anyhow!("{e}"))?;
+                for child in inner.child_hashes() {
+                    if visited.insert(*child) {
+                        stack.push(*child);
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Collect all transactions (with metadata) from a transaction SHAMap root
     /// (the ledger's `TransSetHash`). Returns records sorted by tx_hash.
     /// Empty if `tx_root` is the zero hash (a ledger with no transactions).
@@ -136,6 +339,32 @@ impl NuDBReader {
         diff.deleted.sort();
 
         Ok(diff)
+    }
+
+    /// Compute `diff()` for many `(old_root, new_root)` pairs concurrently, instead of one
+    /// ledger transition at a time. Results are returned in the same order as `pairs` —
+    /// callers must still apply them to a running state map in that order, since each
+    /// ledger's starting state depends on the previous one already being applied; only the
+    /// *discovery* of what changed is parallelized here, not the bookkeeping. Falls back to
+    /// a plain serial loop when `concurrency <= 1`. Uses the same `rayon` thread-pool
+    /// approach as `collect_reachable_concurrent` — callers should pass a concurrency level
+    /// already produced by `calibrate_concurrency` rather than an unbounded/hardcoded one.
+    /// See PLAN.md Immediate TODOs item 10b.
+    pub fn diff_batch_concurrent(
+        &self,
+        pairs: &[(Hash256, Hash256)],
+        concurrency: usize,
+    ) -> Result<Vec<SHAMapDiff>> {
+        if concurrency <= 1 || pairs.len() <= 1 {
+            return pairs.iter().map(|(old, new)| self.diff(old, new)).collect();
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(concurrency)
+            .build()
+            .context("build concurrent diff-batch thread pool")?;
+
+        pool.install(|| pairs.par_iter().map(|(old, new)| self.diff(old, new)).collect())
     }
 
     fn diff_nodes(
@@ -285,7 +514,189 @@ fn read_vl(b: &[u8]) -> Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xrla_common::serialize::sha512half;
+    use xrla_common::shamap::NodeType;
     use xrla_common::state_tree::verify_state_nodes;
+
+    use crate::dat::encode_wire_to_value;
+    use crate::writer::write_nudb_store;
+
+    fn leaf_node(tag: u8) -> SHAMapNode {
+        let content = vec![tag; 16];
+        let hash = sha512half(&content);
+        SHAMapNode { hash, node_type: NodeType::AccountState, content }
+    }
+
+    fn inner_node(children: &[(usize, Hash256)]) -> SHAMapNode {
+        let mut content = vec![0u8; 512];
+        for &(slot, hash) in children {
+            content[slot * 32..(slot + 1) * 32].copy_from_slice(&hash);
+        }
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"MIN\0");
+        buf.extend_from_slice(&content);
+        let hash = sha512half(&buf);
+        SHAMapNode { hash, node_type: NodeType::Inner, content }
+    }
+
+    /// Build a small but genuinely multi-level tree (root -> 4 branches -> 16 leaves, 21
+    /// nodes) into a real NuDB store at `dir`, written through the same NuDB writer/codec
+    /// path production code uses (not hand-rolled bytes). Returns the opened reader and the
+    /// root node.
+    fn build_test_tree(dir: &std::path::Path) -> (NuDBReader, SHAMapNode) {
+        std::fs::create_dir_all(dir).unwrap();
+        let dat_path = dir.join("nudb.dat");
+        let key_path = dir.join("nudb.key");
+
+        let leaves: Vec<SHAMapNode> = (0u8..16).map(leaf_node).collect();
+        let branches: Vec<SHAMapNode> = (0..4usize)
+            .map(|b| {
+                let children: Vec<(usize, Hash256)> =
+                    (0..4usize).map(|i| (i, leaves[b * 4 + i].hash)).collect();
+                inner_node(&children)
+            })
+            .collect();
+        let root = inner_node(
+            &branches.iter().enumerate().map(|(i, n)| (i, n.hash)).collect::<Vec<_>>(),
+        );
+
+        let entries: Vec<(Hash256, Vec<u8>)> = leaves
+            .iter()
+            .chain(branches.iter())
+            .chain(std::iter::once(&root))
+            .map(|n| (n.hash, encode_wire_to_value(&n.content, &n.node_type)))
+            .collect();
+
+        write_nudb_store(&entries, &dat_path, &key_path).unwrap();
+        let nudb = NuDBReader::open_single(&dat_path).unwrap();
+        (nudb, root)
+    }
+
+    /// `collect_reachable_concurrent` at any concurrency level (including the adaptive,
+    /// self-tuned path) must return exactly the same node set as the plain serial walk —
+    /// only fetch order/parallelism should differ, never correctness.
+    #[test]
+    fn concurrent_walk_matches_serial_walk() {
+        let dir = std::env::temp_dir()
+            .join(format!("xrla_nudb_reader_concurrent_test_{}", std::process::id()));
+        let (nudb, root) = build_test_tree(&dir);
+
+        let serial = nudb.collect_reachable(&root.hash).unwrap();
+        let mut serial_hashes: Vec<Hash256> = serial.iter().map(|n| n.hash).collect();
+        serial_hashes.sort();
+        assert_eq!(serial_hashes.len(), 21, "1 root + 4 branches + 16 leaves");
+
+        for &level in &[1usize, 2, 4, 8] {
+            let concurrent = nudb.collect_reachable_concurrent(&root.hash, level).unwrap();
+            let mut concurrent_hashes: Vec<Hash256> = concurrent.iter().map(|n| n.hash).collect();
+            concurrent_hashes.sort();
+            assert_eq!(
+                concurrent_hashes, serial_hashes,
+                "concurrency={level} produced a different node set than the serial walk"
+            );
+        }
+
+        let adaptive = nudb.collect_reachable_adaptive(&root.hash).unwrap();
+        let mut adaptive_hashes: Vec<Hash256> = adaptive.iter().map(|n| n.hash).collect();
+        adaptive_hashes.sort();
+        assert_eq!(adaptive_hashes, serial_hashes);
+
+        let level = nudb.calibrate_concurrency(&root.hash).unwrap();
+        assert!(level >= 1, "calibration must always return a usable concurrency level");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression test for the 2026-07-08 I/O-saturation incident: calibration must always
+    /// return a level from the exact ladder it was given, and must never silently pick
+    /// something outside it (which is how a future edit could reintroduce an unbounded
+    /// climb like the pre-incident `[1, 4, 16, 64, 256]` ladder). Exercises the
+    /// device-detection-independent core (`calibrate_concurrency_with_levels`) directly so
+    /// this is deterministic regardless of what disk the test happens to run on.
+    #[test]
+    fn calibration_never_exceeds_the_given_ladder() {
+        let dir = std::env::temp_dir()
+            .join(format!("xrla_nudb_reader_calibration_ladder_test_{}", std::process::id()));
+        let (nudb, root) = build_test_tree(&dir);
+
+        for ladder in [&[1usize][..], &[1, 2, 4][..], &[1, 2, 4, 8, 16, 32][..]] {
+            let level = nudb.calibrate_concurrency_with_levels(&root.hash, ladder).unwrap();
+            assert!(
+                ladder.contains(&level),
+                "calibrated level {level} is not in the given ladder {ladder:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `diff_batch_concurrent` must produce exactly the same set of added/deleted nodes as
+    /// calling `diff()` serially, one pair at a time — only the discovery order/parallelism
+    /// should differ. Builds a short chain of 4 states (root_0..root_3), each differing from
+    /// the previous by exactly one leaf, all versions written into the same real NuDB store
+    /// (mirroring how a real archive keeps every historical version reachable).
+    #[test]
+    fn diff_batch_concurrent_matches_serial() {
+        let dir = std::env::temp_dir()
+            .join(format!("xrla_nudb_reader_diffbatch_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dat_path = dir.join("nudb.dat");
+        let key_path = dir.join("nudb.key");
+
+        // leaves[0..4] = originals (slots 0..4 at version 0), leaves[4..8] = their
+        // replacements, phased in one slot per version so each consecutive root pair
+        // differs by exactly one leaf.
+        let leaves: Vec<SHAMapNode> = (0u8..8).map(leaf_node).collect();
+        let roots: Vec<SHAMapNode> = (0..4usize)
+            .map(|version| {
+                let children: Vec<(usize, Hash256)> = (0..4usize)
+                    .map(|slot| {
+                        let leaf = if slot < version { &leaves[4 + slot] } else { &leaves[slot] };
+                        (slot, leaf.hash)
+                    })
+                    .collect();
+                inner_node(&children)
+            })
+            .collect();
+
+        let mut entries: Vec<(Hash256, Vec<u8>)> = leaves
+            .iter()
+            .map(|n| (n.hash, encode_wire_to_value(&n.content, &n.node_type)))
+            .collect();
+        entries.extend(roots.iter().map(|n| (n.hash, encode_wire_to_value(&n.content, &n.node_type))));
+
+        write_nudb_store(&entries, &dat_path, &key_path).unwrap();
+        let nudb = NuDBReader::open_single(&dat_path).unwrap();
+
+        let pairs: Vec<(Hash256, Hash256)> =
+            (0..roots.len() - 1).map(|i| (roots[i].hash, roots[i + 1].hash)).collect();
+
+        let serial: Vec<SHAMapDiff> = pairs.iter().map(|(o, n)| nudb.diff(o, n).unwrap()).collect();
+        assert!(
+            serial.iter().all(|d| !d.added.is_empty()),
+            "each consecutive pair should have at least one added node (sanity check on the test tree)"
+        );
+
+        for &level in &[1usize, 2, 4] {
+            let concurrent = nudb.diff_batch_concurrent(&pairs, level).unwrap();
+            assert_eq!(concurrent.len(), serial.len());
+            for (i, (c, s)) in concurrent.iter().zip(serial.iter()).enumerate() {
+                let mut c_added: Vec<Hash256> = c.added.iter().map(|n| n.hash).collect();
+                let mut s_added: Vec<Hash256> = s.added.iter().map(|n| n.hash).collect();
+                c_added.sort();
+                s_added.sort();
+                assert_eq!(c_added, s_added, "concurrency={level} pair {i}: added set mismatch");
+
+                let mut c_deleted = c.deleted.clone();
+                let mut s_deleted = s.deleted.clone();
+                c_deleted.sort();
+                s_deleted.sort();
+                assert_eq!(c_deleted, s_deleted, "concurrency={level} pair {i}: deleted set mismatch");
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Validates `xrla_common::state_tree`'s node-hash formulas against a real mainnet
     /// checkpoint — the entire reachable state tree from a real ledger's `AccountSetHash`,

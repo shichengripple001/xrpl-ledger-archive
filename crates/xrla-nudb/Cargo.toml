@@ -7,6 +7,7 @@ edition = "2021"
 anyhow      = { workspace = true }
 hex         = { workspace = true }
 lz4_flex    = { workspace = true }
+rayon       = { workspace = true }
 thiserror   = { workspace = true }
 xxhash-rust = { workspace = true }
 xrla-common = { path = "../xrla-common" }
