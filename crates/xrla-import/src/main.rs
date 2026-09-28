@@ -1,8 +1,11 @@
-/// xrla-import — import an XRLA chunk file into a rippled-compatible NuDB store.
+/// xrla-import — import one or more XRLA chunk files into a rippled-compatible NuDB store.
 ///
 /// Usage:
 ///   xrla-import --chunk ./chunks/xrla_1_01000000_01001000.xrla \
 ///               --dat /var/lib/rippled/db/nudb.dat
+///
+/// Multiple --chunk arguments (e.g. every range file from a full-history export) are
+/// combined into a single write.
 ///
 /// Verifies the chunk hash, then replays checkpoint+deltas and rebuilds each ledger's
 /// transaction tree, independently recomputing and asserting:
@@ -31,9 +34,12 @@ use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
 #[derive(Parser, Debug)]
 #[command(name = "xrla-import", about = "Import an XRLA chunk file into rippled NuDB")]
 struct Args {
-    /// Path to the .xrla chunk file
-    #[arg(long)]
-    chunk: PathBuf,
+    /// Path(s) to .xrla chunk file(s). Multiple chunks (e.g. every range file from a
+    /// full-history export) are combined into a single write: every chunk's checkpoint
+    /// and delta nodes are unioned before one NuDB store / ledger.db is written, so
+    /// nodes shared across chunk boundaries are naturally deduped, not written twice.
+    #[arg(long, required = true, num_args = 1..)]
+    chunk: Vec<PathBuf>,
 
     /// Path to the NuDB .dat file to write (a sibling .key file is written alongside it)
     #[arg(long)]
@@ -54,37 +60,59 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!("Reading chunk: {}", args.chunk.display());
-    let data = fs::read(&args.chunk)?;
+    let mut all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>> = HashMap::new();
+    let mut tx_nodes: Vec<SHAMapNode> = Vec::new();
+    let mut ledger_rows: Vec<LedgerDbRow> = Vec::new();
 
-    println!("Deserializing and verifying chunk...");
-    let chunk = deserialize_chunk(&data).map_err(|e| anyhow::anyhow!("{e}"))?;
+    for chunk_path in &args.chunk {
+        println!("Reading chunk: {}", chunk_path.display());
+        let data = fs::read(chunk_path)?;
 
-    println!(
-        "Chunk: network={} ledgers={}..{} ({} ledgers)",
-        chunk.network_id,
-        chunk.start_ledger,
-        chunk.end_ledger,
-        chunk.ledger_count()
-    );
-    println!("Chunk hash OK: {}", hex::encode(chunk.chunk_hash));
+        println!("Deserializing and verifying chunk...");
+        let chunk = deserialize_chunk(&data).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let replay = replay_chunk(&chunk, !args.skip_verify)?;
-    println!(
-        "Replayed {} live state nodes, {} tx-tree nodes across {} ledgers",
-        replay.state.len(),
-        replay.tx_nodes.len(),
-        chunk.ledger_count()
-    );
+        println!(
+            "Chunk: network={} ledgers={}..{} ({} ledgers)",
+            chunk.network_id,
+            chunk.start_ledger,
+            chunk.end_ledger,
+            chunk.ledger_count()
+        );
+        println!("Chunk hash OK: {}", hex::encode(chunk.chunk_hash));
+
+        let replay = replay_chunk(&chunk, !args.skip_verify)?;
+        println!(
+            "Replayed {} live state nodes, {} tx-tree nodes across {} ledgers",
+            replay.state.len(),
+            replay.tx_nodes.len(),
+            chunk.ledger_count()
+        );
+
+        // Union across chunks: a node shared across chunk boundaries (e.g. every
+        // later chunk's checkpoint duplicates unchanged nodes from earlier chunks)
+        // is kept once, not once per chunk.
+        for (hash, node) in replay.all_state_nodes {
+            all_state_nodes.entry(hash).or_insert(node);
+        }
+        tx_nodes.extend(replay.tx_nodes);
+        ledger_rows.extend(replay.ledger_rows);
+    }
+
+    let combined = ReplayResult {
+        state: HashMap::new(),
+        all_state_nodes,
+        tx_nodes,
+        ledger_rows,
+    };
 
     let key_path = args.dat.with_extension("key");
     println!("Writing NuDB store: {} / {}", args.dat.display(), key_path.display());
-    write_to_nudb(&replay, &args.dat, &key_path)?;
+    write_to_nudb(&combined, &args.dat, &key_path)?;
 
     if let Some(ledger_db_path) = &args.ledger_db {
         println!("Writing ledger.db: {}", ledger_db_path.display());
-        write_ledger_db(&replay.ledger_rows, ledger_db_path)?;
-        println!("  {} rows written", replay.ledger_rows.len());
+        write_ledger_db(&combined.ledger_rows, ledger_db_path)?;
+        println!("  {} rows written", combined.ledger_rows.len());
     }
 
     println!("Import complete.");
