@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{bail, Result};
 use clap::Parser;
@@ -41,6 +42,13 @@ struct Args {
     /// Skip hash verification (faster, not recommended)
     #[arg(long, default_value_t = false)]
     skip_verify: bool,
+
+    /// Path to write rippled's ledger.db (Ledgers index) alongside the NuDB store. The
+    /// chunk's checkpoint ledger has no in-chunk PrevHash (its parent is external to this
+    /// chunk), so it is not written; every ledger from the first delta onward chains
+    /// internally and is written.
+    #[arg(long)]
+    ledger_db: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -73,16 +81,52 @@ fn main() -> Result<()> {
     println!("Writing NuDB store: {} / {}", args.dat.display(), key_path.display());
     write_to_nudb(&replay, &args.dat, &key_path)?;
 
+    if let Some(ledger_db_path) = &args.ledger_db {
+        println!("Writing ledger.db: {}", ledger_db_path.display());
+        write_ledger_db(&replay.ledger_rows, ledger_db_path)?;
+        println!("  {} rows written", replay.ledger_rows.len());
+    }
+
     println!("Import complete.");
     Ok(())
 }
 
+/// One row for rippled's `Ledgers` table (`ledger.db`), matching `kLgrDbInit`
+/// (`include/xrpl/rdb/DBInit.h`) exactly.
+#[derive(Debug)]
+struct LedgerDbRow {
+    ledger_hash: Hash256,
+    ledger_seq: u32,
+    prev_hash: Hash256,
+    total_coins: u64,
+    closing_time: u32,
+    prev_closing_time: u32,
+    close_time_resolution: u8,
+    close_flags: u8,
+    account_hash: Hash256,
+    trans_hash: Hash256,
+}
+
 #[derive(Debug)]
 struct ReplayResult {
-    /// Final live account-state SHAMap nodes (checkpoint replayed through all deltas).
-    state: HashMap<Hash256, SHAMapNode>,
+    /// Final live account-state SHAMap nodes (checkpoint replayed through all deltas) —
+    /// used for root-tracking/verification during replay, not for the NuDB write-set (a
+    /// real full-history node retains every node any served ledger ever referenced, not
+    /// just the range's last live set; see `all_state_nodes`). Shares node storage with
+    /// `all_state_nodes` via `Rc` — a node present in both maps is one allocation, not two;
+    /// a naive `.clone()` of a 27M-node checkpoint doubled resident memory and OOM'd a real
+    /// run (2026-09-28), which is why this isn't a plain `HashMap<Hash256, SHAMapNode>`.
+    state: HashMap<Hash256, Rc<SHAMapNode>>,
+    /// Every state node the chunk contains: the checkpoint plus every delta's
+    /// `diff.added`, regardless of whether a later delta's `diff.deleted` superseded it.
+    /// This — not `state` — is what gets written to the NuDB store, so every ledger in
+    /// the chunk's range stays servable, not just the last one.
+    all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>>,
     /// Every inner/leaf node of every ledger's rebuilt transaction tree.
     tx_nodes: Vec<SHAMapNode>,
+    /// One row per ledger from the first delta onward (see `Args::ledger_db` doc comment
+    /// for why the checkpoint ledger itself is excluded).
+    ledger_rows: Vec<LedgerDbRow>,
 }
 
 /// Replay checkpoint + deltas, rebuilding each ledger's transaction tree along the way.
@@ -90,11 +134,13 @@ struct ReplayResult {
 /// mismatch): per-transaction authenticity, the account-state root, and the full
 /// LedgerHash chained to the previous ledger.
 fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
-    let mut state: HashMap<Hash256, SHAMapNode> = chunk
+    let mut state: HashMap<Hash256, Rc<SHAMapNode>> = chunk
         .checkpoint
         .iter()
-        .map(|n| (n.hash, n.clone()))
+        .map(|n| (n.hash, Rc::new(n.clone())))
         .collect();
+    // Shares the same Rc<SHAMapNode> as `state`, not a second copy of the node bytes.
+    let mut all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>> = state.clone();
     let mut tx_nodes = Vec::new();
 
     if chunk.tx_maps.is_empty() {
@@ -134,10 +180,13 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
 
     let mut current_root = cp.account_hash;
     let mut prev_ledger_hash = cp.ledger_hash;
+    let mut ledger_rows = Vec::new();
 
     for (i, delta) in chunk.deltas.iter().enumerate() {
         for node in &delta.diff.added {
-            state.insert(node.hash, node.clone());
+            let shared = Rc::new(node.clone());
+            state.insert(node.hash, Rc::clone(&shared));
+            all_state_nodes.insert(node.hash, shared);
         }
         for hash in &delta.diff.deleted {
             state.remove(hash);
@@ -207,11 +256,24 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
             );
         }
 
+        ledger_rows.push(LedgerDbRow {
+            ledger_hash: tx_map.ledger_hash,
+            ledger_seq: tx_map.ledger_seq,
+            prev_hash: prev_ledger_hash,
+            total_coins: tx_map.drops,
+            closing_time: tx_map.close_time,
+            prev_closing_time: tx_map.parent_close_time,
+            close_time_resolution: tx_map.close_time_resolution,
+            close_flags: tx_map.close_flags,
+            account_hash: new_root,
+            trans_hash: tx_hash,
+        });
+
         current_root = new_root;
         prev_ledger_hash = tx_map.ledger_hash;
     }
 
-    Ok(ReplayResult { state, tx_nodes })
+    Ok(ReplayResult { state, all_state_nodes, tx_nodes, ledger_rows })
 }
 
 fn verify_txns_authentic(tx_map: &TxMap) -> Result<()> {
@@ -264,9 +326,63 @@ fn find_new_root(added: &[SHAMapNode], prev_root: &Hash256) -> Result<Hash256> {
 
 /// Write the final live account-state nodes plus every rebuilt transaction-tree node into
 /// a fresh NuDB store (nodes deduped by hash across the two sets).
+/// Write rippled's `ledger.db` `Ledgers` table. Schema matches `kLgrDbInit`
+/// (`include/xrpl/rdb/DBInit.h`) exactly; hashes are stored as uppercase hex, matching
+/// what a real rippled node writes (and what `xrla-export`'s `parse_hash` reads back).
+///
+/// Opens (creating if absent) rather than truncating: pointing this at an *existing*,
+/// already-populated `ledger.db` (e.g. a running instance that already holds a different
+/// ledger range) merges this chunk's rows in rather than destroying the existing ones.
+/// `INSERT OR IGNORE` makes re-running against the same chunk idempotent — a duplicate
+/// `LedgerHash` primary key can only mean the identical row (the hash is content-derived),
+/// never conflicting data under the same key.
+fn write_ledger_db(rows: &[LedgerDbRow], path: &std::path::Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS Ledgers (
+            LedgerHash CHARACTER(64) PRIMARY KEY,
+            LedgerSeq BIGINT UNSIGNED,
+            PrevHash CHARACTER(64),
+            TotalCoins BIGINT UNSIGNED,
+            ClosingTime BIGINT UNSIGNED,
+            PrevClosingTime BIGINT UNSIGNED,
+            CloseTimeRes BIGINT UNSIGNED,
+            CloseFlags BIGINT UNSIGNED,
+            AccountSetHash CHARACTER(64),
+            TransSetHash CHARACTER(64)
+         );
+         CREATE INDEX IF NOT EXISTS SeqLedger ON Ledgers(LedgerSeq);",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO Ledgers (LedgerHash, LedgerSeq, PrevHash, TotalCoins, ClosingTime, \
+         PrevClosingTime, CloseTimeRes, CloseFlags, AccountSetHash, TransSetHash) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+    )?;
+    for row in rows {
+        stmt.execute(rusqlite::params![
+            hex::encode_upper(row.ledger_hash),
+            row.ledger_seq,
+            hex::encode_upper(row.prev_hash),
+            row.total_coins,
+            row.closing_time,
+            row.prev_closing_time,
+            row.close_time_resolution,
+            row.close_flags,
+            hex::encode_upper(row.account_hash),
+            hex::encode_upper(row.trans_hash),
+        ])?;
+    }
+    Ok(())
+}
+
 fn write_to_nudb(replay: &ReplayResult, dat_path: &std::path::Path, key_path: &std::path::Path) -> Result<()> {
-    let mut all: HashMap<Hash256, Vec<u8>> = HashMap::with_capacity(replay.state.len() + replay.tx_nodes.len());
-    for node in replay.state.values() {
+    // Write every state node the chunk ever contained (checkpoint ∪ all diff.added), not
+    // just replay.state's post-replay live set — otherwise only the chunk's last ledger
+    // would be servable. See ReplayResult::all_state_nodes.
+    let mut all: HashMap<Hash256, Vec<u8>> =
+        HashMap::with_capacity(replay.all_state_nodes.len() + replay.tx_nodes.len());
+    for node in replay.all_state_nodes.values() {
         all.entry(node.hash)
             .or_insert_with(|| xrla_nudb::dat::encode_wire_to_value(&node.content, &node.node_type));
     }
@@ -278,7 +394,7 @@ fn write_to_nudb(replay: &ReplayResult, dat_path: &std::path::Path, key_path: &s
     println!(
         "  {} unique nodes ({} state + {} tx-tree, before dedup)",
         entries.len(),
-        replay.state.len(),
+        replay.all_state_nodes.len(),
         replay.tx_nodes.len()
     );
     xrla_nudb::writer::write_nudb_store(&entries, dat_path, key_path)?;
@@ -409,5 +525,59 @@ mod tests {
             err.to_string().contains("LedgerHash"),
             "expected a LedgerHash mismatch error, got: {err}"
         );
+    }
+
+    /// `tag` distinguishes the two synthetic ranges; `seq` must also be folded into the
+    /// hash so every row within a range gets a distinct `LedgerHash` primary key —
+    /// otherwise `INSERT OR IGNORE` collapses same-hash rows exactly as it's meant to.
+    fn ledger_row(seq: u32, tag: u8) -> LedgerDbRow {
+        let mut h = [tag; 32];
+        h[28..32].copy_from_slice(&seq.to_be_bytes());
+        LedgerDbRow {
+            ledger_hash: h,
+            ledger_seq: seq,
+            prev_hash: h,
+            total_coins: 100_000_000_000,
+            closing_time: 1000 + seq,
+            prev_closing_time: 999 + seq,
+            close_time_resolution: 10,
+            close_flags: 0,
+            account_hash: h,
+            trans_hash: h,
+        }
+    }
+
+    /// Writing a chunk's ledger range into a `ledger.db` that already holds a *different*
+    /// range (e.g. a running instance's own current data) must merge, not destroy the
+    /// existing rows — see the delete-then-recreate bug this replaced.
+    #[test]
+    fn write_ledger_db_merges_into_an_existing_populated_file() {
+        let dir = std::env::temp_dir().join(format!("xrla-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ledger.db");
+        let _ = std::fs::remove_file(&path);
+
+        // Simulate a running instance's existing ledger.db: ledgers 100-200.
+        write_ledger_db(&(100..=200).map(|s| ledger_row(s, 1)).collect::<Vec<_>>(), &path)
+            .expect("initial write");
+
+        // Now import an older, disjoint range: 50-99.
+        write_ledger_db(&(50..=99).map(|s| ledger_row(s, 2)).collect::<Vec<_>>(), &path)
+            .expect("merge write");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let count: u32 = conn.query_row("SELECT COUNT(*) FROM Ledgers", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 151, "both ranges (50-99 and 100-200) must be present, not one replacing the other");
+
+        let has_75: bool = conn
+            .query_row("SELECT 1 FROM Ledgers WHERE LedgerSeq = 75", [], |r| r.get(0))
+            .unwrap_or(false);
+        assert!(has_75, "the newly-merged range must be queryable");
+        let has_150: bool = conn
+            .query_row("SELECT 1 FROM Ledgers WHERE LedgerSeq = 150", [], |r| r.get(0))
+            .unwrap_or(false);
+        assert!(has_150, "the pre-existing range must survive the merge, not be wiped");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

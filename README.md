@@ -6,7 +6,10 @@ Getting full history today means ~39 TB and months of P2P backfill, all-or-nothi
 encodes history as deterministic, hash-verified chunks that anyone can download in parallel from
 any source — and that double as the storage backend for a query layer.
 
-See [PLAN.md](PLAN.md) for the design, [DESIGN_NOTES.md](DESIGN_NOTES.md) for the rationale,
+See [CONTEXT.md](CONTEXT.md) for who this is for and what it competes with,
+[PLAN.md](PLAN.md) for the design, [STATUS.md](STATUS.md) for what is actually proven vs. still
+reasoning, [DESIGN_NOTES.md](DESIGN_NOTES.md) for the rationale,
+[E2E_TEST_PLAN.md](E2E_TEST_PLAN.md) for the outstanding end-to-end test,
 [spec/chunk-format.md](spec/chunk-format.md) for the binary format, and
 [crates/xrla-nudb/NUDB_FORMAT.md](crates/xrla-nudb/NUDB_FORMAT.md) for how the NuDB store is read.
 
@@ -51,6 +54,9 @@ xrla-inspect --chunk ./chunks/xrla_1_0105277428_0105277478.xrla --tx-hash <64-ch
 ```
 
 ## Status
+
+> For a claim-by-claim breakdown of **what is proven on real data vs. what is still reasoning**,
+> see [STATUS.md](STATUS.md). `PLAN.md` holds the design rationale and ordered TODO list.
 
 PoC export path proven end-to-end on mainnet and **verified against on-chain hashes**:
 - Full 27M-node state checkpoint — root hashes to the ledger's `AccountSetHash`.

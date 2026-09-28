@@ -22,6 +22,13 @@ holders exceeded a single full-history node.
 
 ## Why Not Clio
 
+> ⚠️ **Corrected 2026-09-28 — see [CONTEXT.md](CONTEXT.md) for the accurate version.** Two claims
+> in this section are **wrong**: Clio *can* reconstruct state at an arbitrary historical ledger
+> within its ingested range (it keeps per-key value history plus a successor table precisely for
+> that), and it does *not* run `online_delete` (a rippled concept). The defensible
+> differentiators are **verifiability**, **inherited-not-guaranteed coverage**, and **no bulk
+> export**. The text below is kept for history; do not quote it.
+
 Clio is not real full history. It stores a transformed/normalized subset of ledger data
 in Cassandra optimized for API queries. It does NOT store raw SHAMap nodes, so:
 

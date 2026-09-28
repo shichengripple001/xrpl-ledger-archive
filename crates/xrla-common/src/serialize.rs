@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 
 use anyhow::Result;
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::chunk::{
     Chunk, ChunkError, LedgerDelta, TxMap, TxRecord,
@@ -17,6 +17,13 @@ pub fn sha512half(data: &[u8]) -> Hash256 {
     let digest = Sha512::digest(data);
     let mut out = [0u8; 32];
     out.copy_from_slice(&digest[..32]);
+    out
+}
+
+pub fn sha256(data: &[u8]) -> [u8; 32] {
+    let digest = Sha256::digest(data);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
     out
 }
 

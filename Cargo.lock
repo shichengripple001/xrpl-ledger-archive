@@ -538,6 +538,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hex",
+ "rusqlite",
  "xrla-common",
  "xrla-nudb",
 ]

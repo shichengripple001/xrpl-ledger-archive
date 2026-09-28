@@ -65,6 +65,18 @@ sequence. Chunks already exported before an amendment are permanently valid — 
 contain exactly the data that existed at those ledger sequences, frozen forever.
 The exporter only needs updating for new ledgers after the amendment activates.
 
+**Core archive vs. the optional decoder — different exposure (2026-07-09).** The core
+export/import/verify path treats all ledger state and transactions as opaque, content-addressed
+bytes — a new ledger object type (new fields, new amendments, e.g. rippled 3.3.0's lending
+protocol) is just a new kind of leaf blob to it, zero code changes needed, ever. Only the optional
+`meta_decode.rs`-style decoder work has any exposure at all, and only to a genuinely new *binary
+wire type* (a new `STI_*`, not a new field on an existing type) — rare (roughly once a year or two;
+`Issue` for AMM, `XChainBridge` for bridges are the precedents), and it fails soft (skips that one
+transaction, doesn't break the tool) even when it happens. See STATUS.md "External changes
+assessed" for the live example of this (`STI_ISSUE`, hit and fixed in ~2 minutes this session).
+**rippled 3.3.0 / lending protocol specifics not yet reviewed** — expected no-impact on the core
+archive by this rule; revisit for the decoder once the ledger-entry format is published.
+
 ---
 
 ## Storage Estimate
@@ -271,9 +283,43 @@ blockchain. See `spec/chunk-format.md` "Verification without full history."
 
 ### Phase 1: Complete importer
 
-- Implement NuDB writer in `xrla-import` (write nodes to `.dat` + rebuild `.key` index)
-- Implement `verify_ledger_hashes()` against actual on-chain ledger header hashes
-- Test: export range → import to fresh NuDB → rippled opens and serves from it
+- ✅ NuDB writer in `xrla-import` (writes nodes to `.dat` + rebuilds `.key` index) —
+  `xrla-nudb/src/writer.rs::write_nudb_store`. Round-trip validated by reading written stores
+  back through `keyfile::Shard::fetch` (including a forced spill-chain case).
+- ✅ `verify_ledger_hashes()` against actual on-chain ledger header hashes — `xrla-import`
+  independently recomputes each ledger's `account_hash`, full chained `LedgerHash`, per-tx
+  `TransactionID`, and every state node's own hash on replay.
+- ⬜ **Test: export range → import to fresh NuDB → rippled opens and serves from it.** Still the
+  one unclosed item in Phase 1, and the only remaining claim in this project that rests on
+  format reasoning rather than observed behavior. `writer.rs` says so itself: the layout it
+  produces matches what our own reader expects, but **has never been opened by a real rippled
+  process**.
+
+**What a rippled cold-start from a reconstructed store actually requires (researched 2026-08-24,
+from rippled source — not yet exercised):**
+
+- **NuDB nodestore (`.dat` + `.key`)** — ✅ we can write this today.
+- **`ledger.db`** — ⬜ **the one missing piece.** rippled reads it to learn which ledger
+  sequences/hashes it holds and where to resume. `xrla-import` does not write it yet. This is a
+  small, well-understood SQLite insert (`LedgerSeq`, `LedgerHash`, `PrevHash`, `AccountSetHash`,
+  `TransSetHash`, close-time fields) — every value is already present and verified in the chunk,
+  so this is wiring, not research.
+- **`wallet.db`** — not needed. Despite the name it holds **no XRPL account data**: only this
+  server's own P2P node identity keypair, peer reservations, and the validator-manifest cache.
+  All XRPL accounts live in the account-state SHAMap inside the nodestore like any other ledger
+  entry.
+- **`transaction.db`** — not needed for startup; it is a convenience tx-lookup index.
+
+  All three SQLite DBs are opened through `DatabaseCon` (`include/xrpl/rdb/DatabaseCon.h`), which
+  lets SQLite create the file if absent and then runs `CREATE TABLE IF NOT EXISTS` from the
+  `*DbInit` arrays in `include/xrpl/rdb/DBInit.h`. No startup path checks for a pre-existing file
+  or refuses to start. If `wallet.db`'s `NodeIdentity` table is empty, `getNodeIdentity()`
+  (`src/libxrpl/server/Wallet.cpp`) mints a fresh random keypair — fine for a non-validating
+  server that only serves ledger data.
+
+  So the remaining work to attempt a real cold start is: **write `ledger.db`, then launch rippled
+  against the reconstructed directory and see what happens.** Everything else can be left for
+  rippled to create.
 
 ### Phase 2: Full history export
 
@@ -406,6 +452,51 @@ The query tool:
   range; everything in a ledger.
 - Answers from the state stream (if also pulled): full ledger state at any sequence, balance-at-
   ledger — queries Clio cannot serve because it discards the SHAMap source data.
+
+**Two distinct query shapes, different mechanisms — do not conflate (2026-07-09 discussion):**
+
+1. **State-snapshot queries** (`AccountRoot` balance, `account_lines`, `account_nfts`, DEX order
+   books) — "what did the account/book hold *at ledger N*." Answered by: reconstruct state at N
+   (checkpoint + replay deltas forward, already implemented in `xrla-export`'s maintain-state loop,
+   reused read-side), then walk/decode the relevant object(s) — direct leaf lookup for
+   `AccountRoot`, an owned-object/directory walk for lines/NFTs/order books. **No new export or
+   storage needed** — everything required is already in existing chunks. The only missing piece is
+   a raw-STObject binary decoder (rippled's field-code binary format), which does not exist
+   anywhere in this codebase yet. Same as how rippled itself answers these — a live on-demand
+   SHAMap walk, not a persistent index.
+
+2. **History-index queries** (`account_tx` — "what did this account do, and when"). Different
+   mechanism entirely: no state reconstruction involved. Needs (a) a decoder for `tx_blob`/
+   `meta_blob` (specifically `meta.AffectedNodes`, to know which accounts a transaction touched),
+   already partially enabled by `tx_tree.rs`'s independent `TransactionHash` verification, and (b)
+   a **persistent index** — `account → [(ledger_seq, tx_hash), ...]`, sorted — built once by
+   scanning every transaction, since a live per-query scan across the whole archive would be far
+   slower than rippled's/Clio's own indexed lookup. This is exactly how rippled (local SQLite tx-DB)
+   and Clio (Cassandra table) answer it too — never a live re-scan.
+   - Estimated cost, corrected 2026-07-09 after checking the real measured PoC rate (~90 tx/ledger
+     recent, not the earlier ~4 tx/ledger guess — that guess was wrong, off by ~22x): full mainnet
+     history is ~117M ledgers. Using the recent measured rate uniformly (upper bound, overestimates
+     early history, which had far less activity): 117M × 90 × ~2.5 accounts/tx ≈ 26B entries ×
+     ~40–60 bytes ≈ **~1–1.6 TB**. A blended estimate accounting for much lower early-years activity
+     (rough, unmeasured): more like **~100–300 GB**. Honest range: **~100 GB to 1.5 TB** — still a
+     small fraction (a few percent, not tens of a percent) of the ~25–30 TB archive floor either
+     way, but not the "rounding error"/"tens of GB" this section originally said.
+   - Should be a **separate rebuildable sidecar artifact**, not baked into the `.xrla` chunk format
+     — it's a deterministic, fully re-derivable function of already-verified chunk data (rebuild
+     any time from the immutable chunks with zero data loss), not part of the archive's core
+     preservation contract. Build it in the same pass as export to avoid a second full re-read
+     later, but keep it a separate file.
+
+**Priority conclusion (2026-07-09): build `account_tx` before the state-snapshot queries.** It
+answers what people actually ask ("what did this account do, and when"), not a supporting fact.
+It's the direct fit for the anchor use case (a market maker reconciling their own account's full
+history against ground truth — see `[[clio-full-history-vs-rippled]]` reasoning: they wanted
+full-history rippled, not Clio, precisely because they needed to trust the completeness of an
+account's history). It's also provably better than Clio's/rippled's own opaque side-index, because
+the underlying tx+meta blobs are already cryptographically anchored (`tx_tree.rs`) — the index is a
+deterministic, re-derivable, auditable computation over verified data, not just rows you have to
+trust. AccountRoot/lines/NFTs/order-book decoding remain real, valuable, and reuse the same
+STObject-parser foundation, but are secondary to this.
 
 **Transaction data:** ✅ done — the exporter populates `tx_maps` from the transaction SHAMap
 (`TransSetHash` tree), verified against on-chain roots. Each record is `(txid, tx_blob, meta_blob)`.
@@ -566,3 +657,52 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
     state map (local read, no NuDB access), and resume delta processing forward from there,
     discarding any partially-written chunk. Bounds lost work on a mid-export crash/interruption
     to one chunk's delta-replay cost, not a repeat of the full trie walk. Not started.
+
+13. **`account_tx` decoder + index (2026-07-09; decoder ✅ 2026-07-28, index ⬜)**. See Phase 4
+    "Two distinct query shapes" above for the full architecture and reasoning.
+
+    ✅ **Decoder done** — `xrla-common/src/meta_decode.rs`. A generic decoder for rippled's
+    canonical binary STObject format that finds every `AccountID`-typed field at any nesting
+    depth inside a `meta_blob`, plus `account_id_to_classic_address` (base58check r-address
+    encoding). Deliberately type-driven rather than field-name-driven: it implements the
+    type-level wire rules only, avoiding a hand-copied field-code table (the same class of
+    silent, hard-to-spot error as the 2026-07-08 sparse-inner-node bit-order bug). Type codes
+    confirmed against rippled `SField.h` `SerializedTypeID` and `ripple-binary-codec`
+    `definitions.json`.
+
+    ✅ **Live query works, unindexed** — `xrla-inspect --account <r-address>` scans a chunk's
+    `meta_blob`s on demand and lists every transaction touching that account, tagged with its
+    ledger. This already delivers the demoable end state *for a single chunk*, cross-checkable
+    against the verified `TransactionHash`/`LedgerHash` chain.
+
+    ⬜ **Remaining**: the persistent index — a one-time read-only pass over existing chunks
+    producing `account → [(ledger_seq, tx_hash), ...]` sorted by `ledger_seq`, written as a
+    separate rebuildable sidecar file per archive range (not embedded in `.xrla` chunks). Needed
+    because a live scan across a full-history archive is far slower than an indexed lookup — the
+    same reason rippled and Clio both maintain their own tx indexes rather than re-scanning.
+
+    ✅ **Cross-checked against a live independent source, not just self-consistent.** Ran clean
+    across all 1,236 real transactions in a real 10-ledger export (105277428–105277438) — zero
+    decode errors, after fixing one real gap it exposed live (`STI_ISSUE`, type 24, added for AMM —
+    not originally handled; fixed in ~2 minutes once hit). For one real account
+    (`rf7QoGcRk2aFMSQNY3zt6FsADavoVucLni`), found 3 matching transactions in that range; all 3
+    independently confirmed against a live public API (xrpscan) — exact match on `Account`,
+    `Destination`, and `ledger_index` for every one, zero false positives.
+
+    ⚠️ **Remaining verification gap**: still **no automated unit tests**, and completeness (false
+    negatives — does it ever *miss* an account reference) is unverified, not just untested. A real
+    `account_tx` RPC comparison would settle this but wasn't achieved this session: xrpscan's
+    account-transactions endpoint ignored the ledger-range filter and only returned its most recent
+    page. Still needs: known-vector tests (cross-checked against an independent implementation),
+    malformed/truncated-input cases, and a real range-scoped `account_tx` comparison against a node
+    whose retention covers the test range. The current `--account` path silently warns and skips on
+    decode failure, so a systematically broken decode would look like "no matches" rather than a
+    failure — this is exactly why the completeness gap matters more than it might otherwise.
+
+14. **AccountRoot/lines/NFTs/order-book decoder (secondary, after 13)**. Shared foundation: a raw
+    STObject binary parser (rippled's field-code binary format — does not exist anywhere in this
+    codebase yet). `AccountRoot` balance-at-ledger-N is the simplest case (single direct leaf
+    lookup after replay-to-N). `account_lines`/`account_nfts` add an owned-object/directory walk
+    (same replay-to-N, different object type + a linked-list walk). DEX order-book reconstruction
+    additionally needs the book-base hash computation + directory-page walk. All three read
+    existing chunk data only — no new export. Not started.

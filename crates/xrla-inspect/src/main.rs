@@ -5,6 +5,7 @@
 ///   xrla-inspect --chunk ... --ledger 105277430
 ///   xrla-inspect --chunk ... --ledger 105277430 --tx 0
 ///   xrla-inspect --chunk ... --tx-hash 010D3CA6...   (no --ledger needed — searches the whole chunk)
+///   xrla-inspect --chunk ... --account rHb9CJAWyB4rj91VRWn96DkukG4bwdtyTh   (account_tx-style scan)
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use xrla_common::chunk::TxRecord;
+use xrla_common::meta_decode::{account_id_to_classic_address, accounts_touched_by_meta};
 use xrla_common::serialize::deserialize_chunk;
 
 #[derive(Parser, Debug)]
@@ -34,6 +36,12 @@ struct Args {
     /// searches every ledger in the chunk, no --ledger needed
     #[arg(long)]
     tx_hash: Option<String>,
+
+    /// account_tx-style scan: list every transaction in this chunk that touched the given
+    /// account (classic r-address), each tagged with its ledger — derived on demand from the
+    /// existing meta_blob data, no separate index required
+    #[arg(long)]
+    account: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -45,7 +53,9 @@ fn main() -> Result<()> {
 
     let chunk = deserialize_chunk(&data).context("parsing chunk")?;
 
-    if let Some(hash_hex) = &args.tx_hash {
+    if let Some(account) = &args.account {
+        print_account_tx(&chunk, account)?;
+    } else if let Some(hash_hex) = &args.tx_hash {
         print_tx_by_hash(&chunk, hash_hex)?;
     } else {
         match (args.ledger, args.tx) {
@@ -154,6 +164,35 @@ fn print_tx_by_hash(chunk: &xrla_common::chunk::Chunk, hash_hex: &str) -> Result
         chunk.start_ledger,
         chunk.end_ledger
     )
+}
+
+/// account_tx-style scan over this chunk only: decode every transaction's meta_blob and
+/// report the ones that touched `account_r_address`. Full-archive coverage would mean running
+/// this same scan over every chunk in the range you care about — no separate index needed.
+fn print_account_tx(chunk: &xrla_common::chunk::Chunk, account_r_address: &str) -> Result<()> {
+    let mut found = 0usize;
+    println!("{:>12}  {:<64}", "ledger", "tx_hash");
+    for tx_map in &chunk.tx_maps {
+        for tx in &tx_map.txns {
+            let touched = match accounts_touched_by_meta(&tx.meta_blob) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("warning: skipping tx {} (meta decode failed: {e})", hex::encode_upper(tx.tx_hash));
+                    continue;
+                }
+            };
+            let matches = touched
+                .iter()
+                .any(|a| account_id_to_classic_address(a) == account_r_address);
+            if matches {
+                found += 1;
+                println!("{:>12}  {:<64}", tx_map.ledger_seq, hex::encode_upper(tx.tx_hash));
+            }
+        }
+    }
+    println!();
+    println!("{found} transaction(s) touched {account_r_address} in ledgers {}..={}", chunk.start_ledger, chunk.end_ledger);
+    Ok(())
 }
 
 fn print_tx_detail(tx: &TxRecord) {

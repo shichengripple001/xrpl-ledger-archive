@@ -120,7 +120,7 @@ fn write_key_header(key: &mut File, version: u16, uid: u64, appnum: u64, salt: u
     hdr[18..26].copy_from_slice(&appnum.to_be_bytes());
     hdr[26..28].copy_from_slice(&(KEY_SIZE as u16).to_be_bytes());
     hdr[28..36].copy_from_slice(&salt.to_be_bytes());
-    let pepper = xxh64(&[], salt); // not used for read-side bucket placement; see NUDB_FORMAT.md
+    let pepper = xxh64(&salt.to_le_bytes(), salt); // NuDB's pepper<Hasher>(salt); verify() rejects a mismatch
     hdr[36..44].copy_from_slice(&pepper.to_be_bytes());
     hdr[44..46].copy_from_slice(&(BLOCK_SIZE as u16).to_be_bytes());
     hdr[46..48].copy_from_slice(&0x8000u16.to_be_bytes()); // load_factor = 0.5
