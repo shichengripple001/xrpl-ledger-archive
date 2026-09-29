@@ -1,11 +1,28 @@
 # XRPL Ledger Archive — Test Plan
 
-> **Status as of 2026-07-01**: most of this document was aspirational — it described tests
-> to write, not tests that existed (`grep -rn "#\[test\]" crates` returned zero matches
-> before the import/round-trip work below). The tests marked ✅ **IMPLEMENTED** are real,
+> **Status as of 2026-09-29**: most of this document is still aspirational — it describes
+> tests to write, not tests that exist. The tests marked ✅ **IMPLEMENTED** are real,
 > committed, and passing (`cargo test --workspace`). Everything else in this document is
 > still a plan, not code — do not assume a described test exists just because it's listed
 > here.
+>
+> Actual inventory: **19 tests** across 6 files —
+> `xrla-common/serialize.rs` (2: `streamed_chunk_round_trips_through_deserialize_chunk`,
+> `dropping_writer_without_finish_removes_tmp_file`),
+> `xrla-common/state_tree.rs` (4), `xrla-common/tx_tree.rs` (4),
+> `xrla-nudb/reader.rs` (4: `concurrent_walk_matches_serial_walk`,
+> `calibration_never_exceeds_the_given_ladder`, `diff_batch_concurrent_matches_serial`,
+> `real_snapshot_state_nodes_self_verify`),
+> `xrla-nudb/writer.rs` (3: `round_trip_small_store`, `round_trip_forces_spill_chain`,
+> `real_snapshot_roundtrip_via_writer`),
+> `xrla-import/main.rs` (2: `two_ledger_chunk_replays_and_verifies`,
+> `write_ledger_db_merges_into_an_existing_populated_file`).
+> `xrla-export` and `xrla-inspect` have no unit tests at all.
+>
+> **Not covered by any test, and worth adding**: v2-vs-v3 format dispatch in
+> `deserialize_chunk` (only v3 is round-trip tested), multi-chunk `xrla-import --chunk`,
+> and a peak-RSS regression guard for the streaming exporter (the bug it fixed was an OOM,
+> which no correctness test would have caught).
 
 ---
 
@@ -13,83 +30,41 @@
 
 ### 1. Unit Tests (per crate)
 
-#### xrla-common
+This section used to list ~35 named unit tests for `serialize.rs`, `shamap.rs`, `dat.rs`,
+`keyfile.rs`, and `reader.rs` that were never written — they sat here unimplemented from
+2026-07-01 to 2026-09-29. They have been removed rather than carried indefinitely as a wish
+list; what follows is the real inventory. Add tests here *when they exist*.
 
-**serialize.rs**
-- `test_sha512half`: known input → verify SHA-512/half output matches reference vector
-- `test_node_roundtrip`: serialize a SHAMapNode, deserialize, assert fields equal
-- `test_node_list_sorted`: write unsorted nodes, read back, assert sorted by hash
-- `test_delta_roundtrip`: serialize LedgerDelta with adds + deletes, deserialize, assert equal
-- `test_tx_map_roundtrip`: serialize TxMap with multiple txns, deserialize, assert equal
-- `test_chunk_hash_coverage`: chunk_hash must cover body bytes, not header — modify one body byte, assert hash changes
-- `test_magic_validation`: deserialize with wrong magic → expect `ChunkError::InvalidMagic`
-- `test_version_validation`: deserialize with version=99 → expect `ChunkError::UnsupportedVersion`
+**`xrla-common`**
+- `state_tree.rs` (4) — `genuine_inner_node_verifies`, `genuine_leaf_node_verifies`,
+  `tampered_inner_content_is_caught`, `tampered_leaf_content_is_caught`
+- `tx_tree.rs` (4) — `empty_tree_is_zero_hash`, `single_tx_root_is_inner_with_one_child`,
+  `two_txns_sharing_first_nibble_split_at_second_level`, `write_vl_matches_read_vl_boundaries`
+- `serialize.rs` (2) — `streamed_chunk_round_trips_through_deserialize_chunk` (v3 write →
+  `deserialize_chunk`), `dropping_writer_without_finish_removes_tmp_file`
 
-**shamap.rs**
-- `test_inner_node_parse`: construct known bitmask + child hashes, parse with `InnerNode::from_bytes`, assert children match
-- `test_inner_node_empty`: bitmask=0 → all children None
-- `test_inner_node_all_children`: bitmask=0xFFFF → 16 children, assert all present
-- `test_inner_node_truncated`: content too short → expect error
+**`xrla-nudb`**
+- `reader.rs` (4) — `concurrent_walk_matches_serial_walk`,
+  `calibration_never_exceeds_the_given_ladder`, `diff_batch_concurrent_matches_serial`,
+  `real_snapshot_state_nodes_self_verify`
+- `writer.rs` (3) — `round_trip_small_store`, `round_trip_forces_spill_chain`,
+  `real_snapshot_roundtrip_via_writer`
 
-**tx_tree.rs** ✅ IMPLEMENTED (`crates/xrla-common/src/tx_tree.rs`)
-- `empty_tree_is_zero_hash`: no transactions → root is `ZERO_HASH`, no nodes
-- `single_tx_root_is_inner_with_one_child`: one tx → root inner has exactly one non-zero
-  slot (matching the tx_hash's first nibble), leaf hash matches the documented formula
-- `two_txns_sharing_first_nibble_split_at_second_level`: two keys sharing nibble 0 produce
-  a second-level inner node, not a collision
-- `write_vl_matches_read_vl_boundaries`: round-trips VL encoding across all three length
-  classes (1/2/3-byte prefixes) against a standalone copy of reader.rs's `read_vl`
+**`xrla-import`**
+- `main.rs` (2) — `two_ledger_chunk_replays_and_verifies`,
+  `write_ledger_db_merges_into_an_existing_populated_file`
 
-#### xrla-nudb
+**`xrla-export`, `xrla-inspect`** — no unit tests.
 
-**writer.rs** ✅ IMPLEMENTED (`crates/xrla-nudb/src/writer.rs`)
-- `round_trip_small_store`: write 50 synthetic entries, read every one back via
-  `keyfile::Shard::fetch`, assert byte-identical; assert an absent key returns `None`
-- `round_trip_forces_spill_chain`: 500 entries into a small bucket table, forcing the
-  spill-chain write/read path (not just primary buckets)
-- `real_snapshot_roundtrip_via_writer` *(ignored — needs a real snapshot)*: samples ~200
-  real, rippled-produced records directly from a live mainnet `nudb.dat`, round-trips them
-  through `encode_wire_to_value` → `write_nudb_store` → `Shard::fetch` →
-  `decode_value_to_wire`, and asserts wire-byte equality. Run with:
-  `RIPPLED_DAT=/path/to/nudb.dat cargo test --package xrla-nudb --lib -- --ignored real_snapshot`
-  — passed against the 5.8 GB mainnet shard captured earlier in this project (196/196 nodes
-  round-tripped exactly).
+**19 total.** Real gaps worth closing, in priority order:
+1. **v2/v3 format dispatch** — only v3 is round-trip tested; nothing exercises reading a v2
+   chunk, even though v2 files exist on disk and `deserialize_chunk` still supports them.
+2. **Multi-chunk `xrla-import --chunk`** — the union-across-chunks path is untested.
+3. **Peak-RSS regression guard for the exporter** — the bug that forced format v3 was an OOM,
+   which no correctness test would have caught.
+4. **Deliberate tamper detection** — `deserialize_chunk` verifies `chunk_hash` on every read,
+   but no test flips a byte and asserts the failure.
 
-**dat.rs** (value decoding)
-- `test_decode_full_inner`: codec `0x03` + 512 bytes → 512-byte content + Inner type byte
-- `test_decode_sparse_inner`: codec `0x02` + mask + N hashes → expanded 512-byte inner
-- `test_decode_sparse_inner_bit_order` *(regression)*: a known node whose `SHA512half(MIN\0 +
-  expanded)` equals its hash — pins the big-endian branch order (`mask & (0x8000>>s)`); the
-  reversed `1<<s` mapping must fail this
-- `test_decode_lz4_leaf`: codec `0x01` LZ4 EncodedBlob → AccountState/TxWithMeta wire bytes
-- `test_decode_ledger_object`: NodeObjectType=1 → None (not part of account SHAMap)
-
-**keyfile.rs** (`.key` hash-table lookup)
-- `test_header_parse`: write a minimal `nudb.key` header → assert salt, block_size, num_buckets
-- `test_bucket_index`: known nhash + modulus/num_buckets → expected bucket (incl. the
-  `>= num_buckets → -= modulus/2` linear-hashing fixup)
-- `test_fetch_present`: synthetic 1-bucket shard with one entry → `fetch(key)` returns its value
-- `test_fetch_absent`: `fetch` of a key not in the shard → `Ok(None)`
-- `test_fetch_prefix_collision`: two entries sharing the 48-bit nhash → full-key verify picks right one
-- `test_fetch_spill_chain`: bucket with a `.dat` spill record → entry in spill is found
-- *(regression)* `test_real_shard_state_root`: against a captured shard fixture, `fetch` a known
-  `AccountSetHash` → returns a 513-byte full-inner value
-
-**reader.rs**
-- `test_multishard_fallback`: node present only in shard1 → `get_node` finds it after shard0 miss
-- `test_get_missing`: get non-existent hash → `get_wire` returns `Ok(None)`
-- `test_parse_tx_leaf`: content `['SND\0'][VL(tx)][VL(meta)][txid]` → `TxRecord` with correct
-  blobs and tx_hash; also exercises 2- and 3-byte VL length prefixes
-- `test_collect_transactions_empty`: `collect_transactions(ZERO_HASH)` → empty vec
-- `test_collect_reachable_single_leaf`: root = one leaf node → collect returns just that node
-- `test_collect_reachable_tree`: build a 3-level tree, collect from root → all nodes returned
-- `test_diff_identical_roots`: old_root == new_root → diff returns empty added + deleted
-- `test_diff_leaf_changed`: swap one leaf → diff returns old leaf in deleted, new in added
-- `test_diff_leaf_added`: add one new leaf → diff returns new leaf in added, nothing deleted
-- `test_diff_leaf_deleted`: remove one leaf → nothing in added, old leaf in deleted
-- `test_diff_inner_node_updated`: change one leaf deep in tree → only changed path nodes in diff
-
----
 
 ### 2. Determinism Tests (critical)
 
@@ -156,21 +131,23 @@ These are the most important tests. They prove the format is suitable for P2P di
 - **Known gap**: uses hand-built synthetic nodes, not a real multi-ledger mainnet range —
   see `test_export_import_roundtrip` below for what's still missing
 
-**test_export_import_roundtrip** — NOT YET RUN end-to-end
-- Export ledger range [N, N+100] from a real rippled NuDB, import into a fresh NuDB, open
-  with a real rippled process, query ledger N+50 — assert state matches original node
-- Blocked in this environment: the populated `ledger.db` used for earlier verification
-  work is gone (only an empty one remains); a real multi-GB `nudb.dat`/`nudb.key` shard is
-  still present and was used for `real_snapshot_roundtrip_via_writer` above, but that test
-  only proves node *content* round-trips, not a full ledger range with real header data,
-  and nothing here has been tested against an actual rippled process opening the result
-- To close this gap: re-run `xrla-export` against a fresh rippled snapshot with a populated
-  `ledger.db`, then `xrla-import` the result, then point a real rippled at the output and
-  query it
+**test_export_import_roundtrip** — ✅ **DONE 2026-09-28**, as a manual run rather than a
+committed test
+- Ran as described: exported a real range, imported into a reconstructed store, pointed a
+  real xrpld at it, and queried — every `account_hash`, account balance, and transaction
+  checked matched the untouched ground-truth node.
+- Stronger than originally specified: the range was first deleted from **all 7 nodes** of the
+  PoC network, so no peer could have supplied the data the node served back.
+- Three real bugs surfaced only at this level, none catchable by our own reader: the NuDB
+  `pepper` bug (real xrpld rejects the store with `hash_mismatch`), a missing `ledger.db`
+  writer, and a destructive-overwrite bug in the first version of that writer.
+- **Still not automated.** This was a hand-driven run against live infrastructure; nothing in
+  `cargo test` covers it, so it will not catch a regression. Automating even a scaled-down
+  version remains open.
 
-**test_hash_verification** — superseded by `two_ledger_chunk_replays_and_verifies` for the
-wiring, and by `test_correctness_ledger_hash` (below) for the formula itself; still open at
-the *real multi-ledger, real rippled process* level described in `test_export_import_roundtrip`.
+**test_hash_verification** — ✅ closed. `two_ledger_chunk_replays_and_verifies` covers the
+wiring, `test_correctness_ledger_hash` (below) the formula, and the 2026-09-28 run above
+closed the *real multi-ledger, real xrpld process* level.
 
 **test_chunk_tamper_detection**
 - Export a valid chunk
@@ -191,13 +168,14 @@ the *real multi-ledger, real rippled process* level described in `test_export_im
 
 ### 4. PoC Validation Tests
 
-Run against a real rippled node (testnet or devnet sufficient).
+Run against a real xrpld node (testnet or devnet sufficient).
 
 **test_poc_delta_sizes**
 - Export consecutive ledgers, print per-ledger delta size
-- Expected range (mainnet, uncompressed wire bytes): **~0.6–1.6 MB/ledger**, ~2,400 changed
-  nodes/ledger. *(The earlier "~35 KB" target was wrong — it assumed 350K ledgers/day; XRPL is
-  ~21,600/day. See PLAN.md Storage Estimate.)*
+- Expected range (mainnet, uncompressed wire bytes): **~1.0–1.6 MB/ledger**, ~2,000–2,700
+  changed nodes/ledger. Measured at the live tip 2026-09-29: 1.4 MB and ~2,620 nodes; the
+  2026-06-30 snapshot gave 1.02 MB and ~1,966. *(The earlier "~35 KB" target was wrong — it
+  assumed 350K ledgers/day; XRPL is ~21,600/day. See PLAN.md Storage Estimate.)*
 - Assert no single delta is 0 bytes (every ledger has some state change)
 
 **test_poc_checkpoint_size**
@@ -233,9 +211,9 @@ diffs are O(changed nodes) and fast; the checkpoint is the cost.
 ## Test Data
 
 For unit tests: construct synthetic NuDB `.dat` files and SHAMap trees in memory.
-No real rippled data needed.
+No real xrpld data needed.
 
-For integration tests: use a local testnet or devnet rippled node.
+For integration tests: use a local testnet or devnet xrpld node.
 A non-full-history node is sufficient as long as the target ledger range is still on disk.
 
 For performance benchmarks: use mainnet data if available, testnet otherwise.
@@ -248,9 +226,9 @@ For performance benchmarks: use mainnet data if available, testnet otherwise.
 # Unit tests
 cargo test --workspace
 
-# Integration tests (requires local rippled node)
-RIPPLED_DAT=/var/lib/rippled/db/nudb.dat \
-RIPPLED_LEDGERS=/var/lib/rippled/db/ledger.db \
+# Integration tests (requires local xrpld node)
+XRPLD_DAT=/var/lib/xrpld/db/nudb.dat \
+XRPLD_LEDGERS=/var/lib/xrpld/db/ledger.db \
 cargo test --workspace -- --include-ignored
 
 # Determinism test (export same range twice, diff output).

@@ -1,8 +1,8 @@
-/// xrla-import — import one or more XRLA chunk files into a rippled-compatible NuDB store.
+/// xrla-import — import one or more XRLA chunk files into a xrpld-compatible NuDB store.
 ///
 /// Usage:
 ///   xrla-import --chunk ./chunks/xrla_1_01000000_01001000.xrla \
-///               --dat /var/lib/rippled/db/nudb.dat
+///               --dat /var/lib/xrpld/db/nudb.dat
 ///
 /// Multiple --chunk arguments (e.g. every range file from a full-history export) are
 /// combined into a single write.
@@ -32,7 +32,7 @@ use xrla_common::state_tree::verify_state_nodes;
 use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
 
 #[derive(Parser, Debug)]
-#[command(name = "xrla-import", about = "Import an XRLA chunk file into rippled NuDB")]
+#[command(name = "xrla-import", about = "Import an XRLA chunk file into xrpld NuDB")]
 struct Args {
     /// Path(s) to .xrla chunk file(s). Multiple chunks (e.g. every range file from a
     /// full-history export) are combined into a single write: every chunk's checkpoint
@@ -49,7 +49,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     skip_verify: bool,
 
-    /// Path to write rippled's ledger.db (Ledgers index) alongside the NuDB store. The
+    /// Path to write xrpld's ledger.db (Ledgers index) alongside the NuDB store. The
     /// chunk's checkpoint ledger has no in-chunk PrevHash (its parent is external to this
     /// chunk), so it is not written; every ledger from the first delta onward chains
     /// internally and is written.
@@ -119,7 +119,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// One row for rippled's `Ledgers` table (`ledger.db`), matching `kLgrDbInit`
+/// One row for xrpld's `Ledgers` table (`ledger.db`), matching `kLgrDbInit`
 /// (`include/xrpl/rdb/DBInit.h`) exactly.
 #[derive(Debug)]
 struct LedgerDbRow {
@@ -354,9 +354,9 @@ fn find_new_root(added: &[SHAMapNode], prev_root: &Hash256) -> Result<Hash256> {
 
 /// Write the final live account-state nodes plus every rebuilt transaction-tree node into
 /// a fresh NuDB store (nodes deduped by hash across the two sets).
-/// Write rippled's `ledger.db` `Ledgers` table. Schema matches `kLgrDbInit`
+/// Write xrpld's `ledger.db` `Ledgers` table. Schema matches `kLgrDbInit`
 /// (`include/xrpl/rdb/DBInit.h`) exactly; hashes are stored as uppercase hex, matching
-/// what a real rippled node writes (and what `xrla-export`'s `parse_hash` reads back).
+/// what a real xrpld node writes (and what `xrla-export`'s `parse_hash` reads back).
 ///
 /// Opens (creating if absent) rather than truncating: pointing this at an *existing*,
 /// already-populated `ledger.db` (e.g. a running instance that already holds a different

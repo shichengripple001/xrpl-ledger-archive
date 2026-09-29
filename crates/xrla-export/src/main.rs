@@ -1,9 +1,9 @@
-/// xrla-export — export a range of ledgers from a rippled NuDB store
+/// xrla-export — export a range of ledgers from a xrpld NuDB store
 /// into an XRLA chunk file.
 ///
 /// Usage:
-///   xrla-export --dat /var/lib/rippled/db/nudb.dat \
-///               --ledgers /var/lib/rippled/db/ledger.db \
+///   xrla-export --dat /var/lib/xrpld/db/nudb.dat \
+///               --ledgers /var/lib/xrpld/db/ledger.db \
 ///               --start 1000000 --end 1001000 \
 ///               --out ./chunks/
 
@@ -15,20 +15,20 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rusqlite::{Connection, params};
 
-use xrla_common::chunk::{chunk_filename, Chunk, LedgerDelta, TxMap, NETWORK_MAINNET};
-use xrla_common::serialize::{calculate_ledger_hash, serialize_chunk, LedgerHashInput};
+use xrla_common::chunk::{chunk_filename, LedgerDelta, TxMap, NETWORK_MAINNET};
+use xrla_common::serialize::{calculate_ledger_hash, ChunkWriter, LedgerHashInput};
 use xrla_common::shamap::{Hash256, SHAMapNode};
 use xrla_nudb::NuDBReader;
 
 #[derive(Parser, Debug)]
 #[command(name = "xrla-export", about = "Export XRPL ledger history to chunk files")]
 struct Args {
-    /// Path to a rippled NuDB .dat file (sibling nudb.key must exist). Repeat for each
+    /// Path to a xrpld NuDB .dat file (sibling nudb.key must exist). Repeat for each
     /// shard — online_delete keeps two databases live and the state spans both.
     #[arg(long, required = true, num_args = 1..)]
     dat: Vec<PathBuf>,
 
-    /// Path to rippled ledger SQLite database (ledger.db)
+    /// Path to xrpld ledger SQLite database (ledger.db)
     #[arg(long)]
     ledgers: PathBuf,
 
@@ -108,18 +108,30 @@ fn main() -> Result<()> {
         concurrency
     );
 
+    // Own the nodes directly in `state` (move, not clone) — `initial_nodes` isn't kept
+    // around as a second copy.
     let mut state: HashMap<Hash256, SHAMapNode> =
-        initial_nodes.iter().map(|n| (n.hash, n.clone())).collect();
+        initial_nodes.into_iter().map(|n| (n.hash, n)).collect();
 
     let first_txns = nudb
         .collect_transactions(&first_info.tx_hash)
         .with_context(|| format!("tx collect failed at ledger {}", args.start))?;
+    let first_txns_len = first_txns.len();
 
     let mut chunk_start = args.start;
-    let mut chunk_checkpoint_hash = first_ledger_hash;
-    let mut chunk_checkpoint_nodes = initial_nodes;
-    let mut chunk_deltas: Vec<LedgerDelta> = Vec::new();
-    let mut chunk_tx_maps: Vec<TxMap> = vec![TxMap {
+    let mut chunk_end = (chunk_start + args.chunk_size - 1).min(args.end);
+    let mut chunk_writer = ChunkWriter::create(
+        args.out.join(chunk_filename(args.network_id, chunk_start, chunk_end)),
+        args.network_id,
+        chunk_start,
+        chunk_end,
+        first_ledger_hash,
+    )?;
+    {
+        let mut refs: Vec<&SHAMapNode> = state.values().collect();
+        chunk_writer.write_checkpoint(&mut refs)?;
+    }
+    chunk_writer.write_tx_map(&TxMap {
         ledger_seq: args.start,
         ledger_hash: first_ledger_hash,
         account_hash: first_info.account_hash,
@@ -129,13 +141,14 @@ fn main() -> Result<()> {
         close_time_resolution: first_info.close_time_resolution,
         close_flags: first_info.close_flags,
         txns: first_txns,
-    }];
+    })?;
+    let mut chunk_checkpoint_node_count = state.len();
 
     let mut prev_account_hash = first_info.account_hash;
     let mut chunks_written = 0usize;
     let mut total_added = 0usize;
     let mut total_deleted = 0usize;
-    let mut total_txns = chunk_tx_maps[0].txns.len();
+    let mut total_txns = first_txns_len;
 
     // Process ledgers in batches of up to `concurrency` at a time: fetch the batch's ledger
     // info (cheap, local SQLite — unchanged), compute all their diffs CONCURRENTLY against
@@ -198,48 +211,49 @@ fn main() -> Result<()> {
             total_deleted += diff.deleted.len();
             total_txns += txns.len();
 
+            let tx_map = TxMap {
+                ledger_seq: s,
+                ledger_hash: curr_ledger_hash,
+                account_hash: curr_info.account_hash,
+                drops: curr_info.total_coins,
+                parent_close_time: curr_info.prev_closing_time,
+                close_time: curr_info.closing_time,
+                close_time_resolution: curr_info.close_time_resolution,
+                close_flags: curr_info.close_flags,
+                txns,
+            };
+
             if s - chunk_start == args.chunk_size {
-                // Close out the just-finished chunk (its checkpoint + deltas accumulated so far).
-                write_chunk(
-                    &args,
-                    chunk_start,
-                    s - 1,
-                    chunk_checkpoint_hash,
-                    std::mem::take(&mut chunk_checkpoint_nodes),
-                    std::mem::take(&mut chunk_deltas),
-                    std::mem::take(&mut chunk_tx_maps),
-                )?;
+                // Close out the just-finished chunk (streamed straight to disk as it went —
+                // nothing buffered here to flush).
+                chunk_writer.finish()?;
                 chunks_written += 1;
+                println!(
+                    "  closed chunk [{chunk_start}, {}] ({} checkpoint nodes)",
+                    s - 1,
+                    chunk_checkpoint_node_count
+                );
 
                 // This ledger becomes the NEXT chunk's checkpoint ledger — its state is
                 // already in `state` (we just applied its diff above), so no NuDB walk needed.
                 chunk_start = s;
-                chunk_checkpoint_hash = curr_ledger_hash;
-                chunk_checkpoint_nodes = state.values().cloned().collect();
-                chunk_tx_maps.push(TxMap {
-                    ledger_seq: s,
-                    ledger_hash: curr_ledger_hash,
-                    account_hash: curr_info.account_hash,
-                    drops: curr_info.total_coins,
-                    parent_close_time: curr_info.prev_closing_time,
-                    close_time: curr_info.closing_time,
-                    close_time_resolution: curr_info.close_time_resolution,
-                    close_flags: curr_info.close_flags,
-                    txns,
-                });
+                chunk_end = (chunk_start + args.chunk_size - 1).min(args.end);
+                chunk_writer = ChunkWriter::create(
+                    args.out.join(chunk_filename(args.network_id, chunk_start, chunk_end)),
+                    args.network_id,
+                    chunk_start,
+                    chunk_end,
+                    curr_ledger_hash,
+                )?;
+                {
+                    let mut refs: Vec<&SHAMapNode> = state.values().collect();
+                    chunk_checkpoint_node_count = refs.len();
+                    chunk_writer.write_checkpoint(&mut refs)?;
+                }
+                chunk_writer.write_tx_map(&tx_map)?;
             } else {
-                chunk_deltas.push(LedgerDelta { ledger_seq: s, diff });
-                chunk_tx_maps.push(TxMap {
-                    ledger_seq: s,
-                    ledger_hash: curr_ledger_hash,
-                    account_hash: curr_info.account_hash,
-                    drops: curr_info.total_coins,
-                    parent_close_time: curr_info.prev_closing_time,
-                    close_time: curr_info.closing_time,
-                    close_time_resolution: curr_info.close_time_resolution,
-                    close_flags: curr_info.close_flags,
-                    txns,
-                });
+                chunk_writer.write_delta(&LedgerDelta { ledger_seq: s, diff })?;
+                chunk_writer.write_tx_map(&tx_map)?;
             }
 
             prev_account_hash = curr_info.account_hash;
@@ -249,16 +263,14 @@ fn main() -> Result<()> {
     }
 
     // Final (possibly partial) chunk.
-    write_chunk(
-        &args,
-        chunk_start,
-        args.end,
-        chunk_checkpoint_hash,
-        chunk_checkpoint_nodes,
-        chunk_deltas,
-        chunk_tx_maps,
-    )?;
+    let chunk_hash = chunk_writer.finish()?;
     chunks_written += 1;
+    println!(
+        "  closed chunk [{chunk_start}, {}] ({} checkpoint nodes)\n  chunk_hash: {}",
+        args.end,
+        chunk_checkpoint_node_count,
+        hex::encode(chunk_hash)
+    );
 
     let ledger_count = args.end - args.start;
     println!(
@@ -270,52 +282,8 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn write_chunk(
-    args: &Args,
-    start_ledger: u32,
-    end_ledger: u32,
-    checkpoint_hash: Hash256,
-    checkpoint: Vec<SHAMapNode>,
-    deltas: Vec<LedgerDelta>,
-    tx_maps: Vec<TxMap>,
-) -> Result<()> {
-    let checkpoint_len = checkpoint.len();
-    let delta_count = deltas.len();
-
-    let chunk = Chunk {
-        network_id: args.network_id,
-        start_ledger,
-        end_ledger,
-        checkpoint_hash,
-        chunk_hash: [0u8; 32], // computed by serialize_chunk
-        checkpoint,
-        deltas,
-        tx_maps,
-    };
-
-    let bytes = serialize_chunk(&chunk)?;
-    let filename = chunk_filename(args.network_id, start_ledger, end_ledger);
-    let out_path = args.out.join(&filename);
-    fs::write(&out_path, &bytes)?;
-
-    // chunk_hash is at byte offset 77 in the header (4+1+4+4+4+32+32 = 81 bytes header,
-    // chunk_hash starts at offset 4+1+4+4+4+32 = 49)
-    let chunk_hash_hex = hex::encode(&bytes[49..81]);
-
-    println!(
-        "Wrote {} ({} bytes, {} checkpoint nodes, {} deltas)\n  chunk_hash: {}",
-        out_path.display(),
-        bytes.len(),
-        checkpoint_len,
-        delta_count,
-        chunk_hash_hex
-    );
-
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
-// LedgerIndex: reads rippled's ledger SQLite database
+// LedgerIndex: reads xrpld's ledger SQLite database
 //
 // Table: Ledgers
 //   LedgerHash      TEXT — hex-encoded ledger hash

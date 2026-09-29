@@ -197,10 +197,10 @@ fn print_account_tx(chunk: &xrla_common::chunk::Chunk, account_r_address: &str) 
 
 fn print_tx_detail(tx: &TxRecord) {
     println!("tx_hash:   {}", hex::encode_upper(tx.tx_hash));
-    println!("tx_blob ({} bytes, rippled binary serialization):", tx.tx_blob.len());
+    println!("tx_blob ({} bytes, xrpld binary serialization):", tx.tx_blob.len());
     println!("{}", hex::encode(&tx.tx_blob));
     println!();
-    println!("meta_blob ({} bytes, rippled binary serialization):", tx.meta_blob.len());
+    println!("meta_blob ({} bytes, xrpld binary serialization):", tx.meta_blob.len());
     println!("{}", hex::encode(&tx.meta_blob));
 }
 

@@ -1,4 +1,4 @@
-/// NuDB reader — reads rippled's on-disk NuDB store directly.
+/// NuDB reader — reads xrpld's on-disk NuDB store directly.
 ///
 /// NuDB is a key-value store where:
 ///   key   = 32-byte SHA-512/half node hash

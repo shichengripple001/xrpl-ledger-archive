@@ -5,7 +5,7 @@
 /// multi-GB .dat file (record offsets reach 4+ GB), so a front-to-back scan stops at the
 /// first zero gap and recovers only a tiny fraction of the tree.
 ///
-/// Format reverse-engineered against rippled 3.2.0 and the NuDB library source
+/// Format reverse-engineered against xrpld 3.2.0 and the NuDB library source
 /// (https://github.com/cppalliance/NuDB, detail/bucket.hpp). See NUDB_FORMAT.md.
 ///
 /// Key file header (first block, block_size bytes):
@@ -61,7 +61,7 @@ fn read_u48(b: &[u8]) -> u64 {
     u64::from_be_bytes(x)
 }
 
-/// A single NuDB database (one .dat + .key pair). rippled's online_delete keeps two
+/// A single NuDB database (one .dat + .key pair). xrpld's online_delete keeps two
 /// of these live at once during rotation; the full state spans both, so callers should
 /// try each shard in turn.
 pub struct Shard {

@@ -1,11 +1,11 @@
-/// Minimal generic decoder for rippled's canonical binary STObject format, applied to
+/// Minimal generic decoder for xrpld's canonical binary STObject format, applied to
 /// transaction `meta_blob`s. Goal: find every `AccountID`-typed field value anywhere in a
 /// transaction's metadata (nested arbitrarily inside `AffectedNodes`/`FinalFields`/etc.),
 /// without needing a full field-name table — just the type-level wire rules, which are far
 /// less error-prone than hand-copying a field-code table (see the 2026-07-08 sparse-inner-node
 /// bit-order bug: getting one detail of a binary format wrong is silent and easy to miss).
 ///
-/// Field/type codes confirmed against rippled's `SField.h` `SerializedTypeID` enum and
+/// Field/type codes confirmed against xrpld's `SField.h` `SerializedTypeID` enum and
 /// `ripple-binary-codec`'s `definitions.json` (2026-07-28).
 use anyhow::{bail, Result};
 
@@ -49,7 +49,7 @@ impl<'a> Cursor<'a> {
         self.i >= self.b.len()
     }
 
-    /// rippled variable-length prefix: inverse of `tx_tree::write_vl`.
+    /// xrpld variable-length prefix: inverse of `tx_tree::write_vl`.
     fn read_vl_len(&mut self) -> Result<usize> {
         let b1 = self.byte()? as usize;
         if b1 <= 192 {
@@ -64,7 +64,7 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Field header: (type_code, field_code). See rippled `SField::getField` wire format.
+    /// Field header: (type_code, field_code). See xrpld `SField::getField` wire format.
     fn read_field_header(&mut self) -> Result<(u32, u32)> {
         let b1 = self.byte()? as u32;
         let mut type_code = b1 >> 4;

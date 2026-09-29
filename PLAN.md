@@ -8,7 +8,7 @@ lowest-priority task and only works from direct peers.
 
 There is no existing mechanism to share full history between operators.
 
-History sharding (2018–2024) was the official attempt. Removed in rippled v2.3.0 because
+History sharding (2018–2024) was the official attempt. Removed in xrpld v2.3.0 because
 the SHAMap structure caused every shard to duplicate unchanged InnerNodes — aggregate
 shard storage exceeded a single full-history node.
 
@@ -21,9 +21,9 @@ that actually changed between consecutive ledgers. Unchanged nodes are not repea
 Chunks are deterministic, content-addressed, and self-verifying against on-chain hashes.
 
 A new operator downloads chunks in parallel from any source, verifies each chunk against
-on-chain hashes, imports into rippled NuDB, bootstrapped in hours not months.
+on-chain hashes, imports into xrpld NuDB, bootstrapped in hours not months.
 
-**No protocol changes. No XLS amendment. No rippled dependency at runtime.**
+**No protocol changes. No XLS amendment. No xrpld dependency at runtime.**
 
 ---
 
@@ -32,23 +32,23 @@ on-chain hashes, imports into rippled NuDB, bootstrapped in hours not months.
 - No GC: predictable performance for large file I/O
 - Single static binary: operators just download and run
 - Memory safety: critical for a tool handling tens of terabytes
-- No dependency on rippled process or source — reads NuDB files directly
+- No dependency on xrpld process or source — reads NuDB files directly
 
 ---
 
 ## Key Design Decisions
 
-### No rippled dependency
+### No xrpld dependency
 
 The exporter reads NuDB `.dat`/`.key` files directly from disk via O(1) key-file lookups
-(see `crates/xrla-nudb/NUDB_FORMAT.md`). rippled does not need to be running. This means:
+(see `crates/xrla-nudb/NUDB_FORMAT.md`). xrpld does not need to be running. This means:
 - Works on any machine with the NuDB files mounted
-- No version coupling to rippled releases
+- No version coupling to xrpld releases
 - Can run on a cold copy/snapshot of the database
 
-**The database must be quiesced for a consistent snapshot.** rippled's `online_delete`
+**The database must be quiesced for a consistent snapshot.** xrpld's `online_delete`
 rotates between two live NuDB databases ("shards"); copying while it runs yields a torn
-snapshot. Stop the rippled service, copy *both* shard directories (each has `nudb.dat` +
+snapshot. Stop the xrpld service, copy *both* shard directories (each has `nudb.dat` +
 `nudb.key`) plus `ledger.db`, then restart. Pass every shard's `.dat` to the exporter.
 
 ### Determinism via hash-sort
@@ -67,14 +67,14 @@ The exporter only needs updating for new ledgers after the amendment activates.
 
 **Core archive vs. the optional decoder — different exposure (2026-07-09).** The core
 export/import/verify path treats all ledger state and transactions as opaque, content-addressed
-bytes — a new ledger object type (new fields, new amendments, e.g. rippled 3.3.0's lending
+bytes — a new ledger object type (new fields, new amendments, e.g. xrpld 3.3.0's lending
 protocol) is just a new kind of leaf blob to it, zero code changes needed, ever. Only the optional
 `meta_decode.rs`-style decoder work has any exposure at all, and only to a genuinely new *binary
 wire type* (a new `STI_*`, not a new field on an existing type) — rare (roughly once a year or two;
 `Issue` for AMM, `XChainBridge` for bridges are the precedents), and it fails soft (skips that one
 transaction, doesn't break the tool) even when it happens. See STATUS.md "External changes
 assessed" for the live example of this (`STI_ISSUE`, hit and fixed in ~2 minutes this session).
-**rippled 3.3.0 / lending protocol specifics not yet reviewed** — expected no-impact on the core
+**xrpld 3.3.0 / lending protocol specifics not yet reviewed** — expected no-impact on the core
 archive by this rule; revisit for the decoder once the ledger-entry format is published.
 
 ---
@@ -93,6 +93,24 @@ delta per ledger:                      ~1,966 changed nodes, ~1.02 MB raw (~0.51
 transactions per ledger:               ~90 txns (4,500 over 51 ledgers); verified vs TransSetHash
 ```
 
+### Re-measured at scale on live mainnet (2026-09-29)
+
+20,000-ledger single-chunk export (107287900–107307899), taken at the current tip rather than
+from a year-old snapshot. Supersedes the figures above where they disagree:
+
+```
+checkpoint (full state @ 107287900):  28,311,240 nodes, ~13 GB   (~468 B/node, uncompressed)
+delta per ledger:                      ~2,620 changed nodes, ~1.4 MB raw
+transactions per ledger:               ~141 txns (2,849,339 over 19,999 ledgers)
+whole chunk (1 checkpoint + 20k):      38.5 GB in 7m35s, 18.3 GB peak RSS (format v3)
+```
+
+Both the per-node size (333 → 468 B) and the per-ledger delta (1.02 → 1.4 MB) grew against the
+2026-06-30 numbers, consistent with the network's own growth over that interval. **Do not scale
+these to full history** — see STATUS.md: today's rate is ~4.3x the lifetime average, so
+extrapolating the tip density across 107.3M ledgers overestimates by ~6x (206 TB predicted vs.
+32–35 TB actually on disk at a real full-history node).
+
 ### The original 35 KB/ledger estimate was wrong by ~33×
 
 The estimate below assumed **350,000 ledgers/day**. XRPL actually closes a ledger every
@@ -104,7 +122,7 @@ The estimate below assumed **350,000 ledgers/day**. XRPL actually closes a ledge
 
 Our measured **1.16 MB/ledger is uncompressed** wire bytes; NuDB stores values LZ4-compressed
 (~2× on these nodes), so 1.16 MB ÷ 2 ≈ 555 KB reconciles with the disk-growth figure. The
-PoC measurement and rippled's growth rate agree once the ledgers/day error is fixed.
+PoC measurement and xrpld's growth rate agree once the ledgers/day error is fixed.
 
 ### The size model (the dedup point)
 
@@ -147,12 +165,12 @@ against a full node's actual `.dat` size.
 
 ### Full-history server evidence (2026-07-08)
 
-Found two real rippled full-history nodes (`devnet-fh-usw2-01`, `livenet-fh-usw2-01`) and inspected
+Found two real xrpld full-history nodes (`devnet-fh-usw2-01`, `livenet-fh-usw2-01`) and inspected
 their on-disk layout directly:
 
 - **No `shard_db`, no `online_delete`.** Both run a single, permanently-growing `node_db` — one
   `nudb.dat`/`nudb.key` pair covering the node's entire retained range, nothing ever purged. The
-  rippled shard store (fixed ~16,384-ledger immutable shards) is a separate, opt-in config these
+  xrpld shard store (fixed ~16,384-ledger immutable shards) is a separate, opt-in config these
   full-history boxes aren't using. This invalidates any plan that assumes "just open the shard for
   the ledger range you want" on mainnet full history — there is no shard boundary to target.
 - **Mainnet (`livenet-fh-usw2-01`) real sizes:** `nudb.dat` = 29,487,676,646,008 bytes (~29.5 TB),
@@ -199,7 +217,7 @@ xrpl-ledger-archive/
 │   │       ├── chunk.rs        Chunk, LedgerDelta, TxMap structs + chunk_filename()
 │   │       ├── shamap.rs       SHAMapNode, InnerNode, SHAMapDiff, NodeType
 │   │       └── serialize.rs    serialize_chunk(), deserialize_chunk(), sha512half()
-│   ├── xrla-nudb/              NuDB reader (no rippled dependency)
+│   ├── xrla-nudb/              NuDB reader (no xrpld dependency)
 │   │   ├── NUDB_FORMAT.md      on-disk .dat/.key format (reverse-engineered)
 │   │   └── src/
 │   │       ├── dat.rs          .dat value codecs (LZ4/inner) + EncodedBlob → wire bytes
@@ -225,7 +243,7 @@ Goal: export consecutive mainnet ledgers, verify determinism, measure delta size
 
 Status:
 1. ✅ **NuDB reader** (`xrla-nudb`): `.dat`/`.key` format reverse-engineered and verified
-   against rippled 3.2.0 + NuDB library source. O(1) key-file lookups, multi-shard,
+   against xrpld 3.2.0 + NuDB library source. O(1) key-file lookups, multi-shard,
    spill-chain aware. Full 27M-node mainnet state tree reads correctly. See NUDB_FORMAT.md.
 2. ✅ **LedgerIndex** (`xrla-export`): reads `Ledgers` table (`LedgerSeq`, `LedgerHash`,
    `AccountSetHash`) via `rusqlite`.
@@ -247,7 +265,7 @@ Status:
    zstd), ~1,966 changed nodes/ledger; ~90 txns/ledger.
 
 **Bug found and fixed by the correctness check:** sparse inner nodes (codec 0x02) were decoded
-with the branch mask bit-reversed (`mask & (1<<s)` instead of `mask & (0x8000>>s)` — rippled uses
+with the branch mask bit-reversed (`mask & (1<<s)` instead of `mask & (0x8000>>s)` — xrpld uses
 big-endian bit order, branch 0 = MSB). ~93% of sparse inners decoded wrong. It was **deterministic**,
 so two runs matched and the first "success" claim was premature. Only recomputing the root against
 the on-chain hash caught it. Fixed in `dat.rs::decode_sparse_inner`; chunk_hash changed from the
@@ -289,21 +307,26 @@ blockchain. See `spec/chunk-format.md` "Verification without full history."
 - ✅ `verify_ledger_hashes()` against actual on-chain ledger header hashes — `xrla-import`
   independently recomputes each ledger's `account_hash`, full chained `LedgerHash`, per-tx
   `TransactionID`, and every state node's own hash on replay.
-- ⬜ **Test: export range → import to fresh NuDB → rippled opens and serves from it.** Still the
-  one unclosed item in Phase 1, and the only remaining claim in this project that rests on
-  format reasoning rather than observed behavior. `writer.rs` says so itself: the layout it
-  produces matches what our own reader expects, but **has never been opened by a real rippled
-  process**.
+- ✅ **Test: export range → import to fresh NuDB → xrpld opens and serves from it.** Closed
+  2026-09-28 — see `STATUS.md` "Proven: a real xrpld process opens, boots from, and correctly
+  serves our output" and `E2E_TEST_PLAN.md`. A real `xrpld 3.4.0-rc6` opened, booted from, and
+  correctly served a full history reconstructed entirely by `xrla-import`, verified against ledgers
+  no peer in the network could have supplied. Three real bugs (NuDB pepper, `ledger.db` overwrite,
+  an OOM from a naive clone) were found only by this test, not by any prior reader/writer round
+  trip.
 
-**What a rippled cold-start from a reconstructed store actually requires (researched 2026-08-24,
-from rippled source — not yet exercised):**
+**What a xrpld cold-start from a reconstructed store actually requires (researched 2026-08-24
+from xrpld source; exercised and confirmed against a real xrpld 2026-09-28):**
 
-- **NuDB nodestore (`.dat` + `.key`)** — ✅ we can write this today.
-- **`ledger.db`** — ⬜ **the one missing piece.** rippled reads it to learn which ledger
-  sequences/hashes it holds and where to resume. `xrla-import` does not write it yet. This is a
-  small, well-understood SQLite insert (`LedgerSeq`, `LedgerHash`, `PrevHash`, `AccountSetHash`,
-  `TransSetHash`, close-time fields) — every value is already present and verified in the chunk,
-  so this is wiring, not research.
+- **NuDB nodestore (`.dat` + `.key`)** — ✅ we can write this today. One caveat that took a real
+  xrpld to surface: the `.key` header's `pepper` must be `xxh64(salt.to_le_bytes(), salt)` or
+  xrpld refuses the store with `hash_mismatch`. See `crates/xrla-nudb/NUDB_FORMAT.md`.
+- **`ledger.db`** — ✅ done. `xrla-import --ledger-db` writes the `Ledgers` table
+  (`LedgerSeq`, `LedgerHash`, `PrevHash`, `AccountSetHash`, `TransSetHash`, close-time fields)
+  per xrpld's `kLgrDbInit` schema. It **merges** into an existing file via `INSERT OR IGNORE`
+  rather than replacing it — an earlier version deleted the file outright, which would have
+  destroyed a populated node's index. Regression-tested
+  (`write_ledger_db_merges_into_an_existing_populated_file`).
 - **`wallet.db`** — not needed. Despite the name it holds **no XRPL account data**: only this
   server's own P2P node identity keypair, peer reservations, and the validator-manifest cache.
   All XRPL accounts live in the account-state SHAMap inside the nodestore like any other ledger
@@ -317,9 +340,13 @@ from rippled source — not yet exercised):**
   (`src/libxrpl/server/Wallet.cpp`) mints a fresh random keypair — fine for a non-validating
   server that only serves ledger data.
 
-  So the remaining work to attempt a real cold start is: **write `ledger.db`, then launch rippled
-  against the reconstructed directory and see what happens.** Everything else can be left for
-  rippled to create.
+  That cold start has since been run (2026-09-28). A real xrpld launched against the
+  reconstructed directory opened it, served the imported range, and matched ground truth on
+  every account and transaction checked. Two traps found in the process, neither visible from
+  the source reading above: `earliest_seq` in `[node_db]` silently caps what the node will
+  serve regardless of what is physically present, and `complete_ledgers` can disagree with a
+  direct `ledger {ledger_index: N}` call — verify with the per-ledger RPC, not the summary
+  field. See STATUS.md.
 
 ### Phase 2: Full history export
 
@@ -335,8 +362,8 @@ third for operational safety over a multi-day run:
    **validated end-to-end against real data (2026-07-08)**. `xrla-export` keeps one running
    `HashMap<Hash256, SHAMapNode>` alive for the entire export (see `--chunk-size`, default
    10,000 ledgers). Each ledger's delta is applied to it as the range is scanned forward; at a
-   chunk boundary, the current in-memory map is serialized as that chunk's checkpoint
-   (`write_chunk` helper) instead of calling `collect_reachable` again. This reduces the number
+   chunk boundary, the current in-memory map is written as that chunk's checkpoint (streamed
+   via `ChunkWriter`) instead of calling `collect_reachable` again. This reduces the number
    of full trie walks for the entire export from ~1 per chunk to **one, total**.
 
    Validation run: real mainnet NuDB snapshot (ledgers 105277428–105277528, 100 ledgers),
@@ -461,8 +488,8 @@ The query tool:
    reused read-side), then walk/decode the relevant object(s) — direct leaf lookup for
    `AccountRoot`, an owned-object/directory walk for lines/NFTs/order books. **No new export or
    storage needed** — everything required is already in existing chunks. The only missing piece is
-   a raw-STObject binary decoder (rippled's field-code binary format), which does not exist
-   anywhere in this codebase yet. Same as how rippled itself answers these — a live on-demand
+   a raw-STObject binary decoder (xrpld's field-code binary format), which does not exist
+   anywhere in this codebase yet. Same as how xrpld itself answers these — a live on-demand
    SHAMap walk, not a persistent index.
 
 2. **History-index queries** (`account_tx` — "what did this account do, and when"). Different
@@ -471,7 +498,7 @@ The query tool:
    already partially enabled by `tx_tree.rs`'s independent `TransactionHash` verification, and (b)
    a **persistent index** — `account → [(ledger_seq, tx_hash), ...]`, sorted — built once by
    scanning every transaction, since a live per-query scan across the whole archive would be far
-   slower than rippled's/Clio's own indexed lookup. This is exactly how rippled (local SQLite tx-DB)
+   slower than xrpld's/Clio's own indexed lookup. This is exactly how xrpld (local SQLite tx-DB)
    and Clio (Cassandra table) answer it too — never a live re-scan.
    - Estimated cost, corrected 2026-07-09 after checking the real measured PoC rate (~90 tx/ledger
      recent, not the earlier ~4 tx/ledger guess — that guess was wrong, off by ~22x): full mainnet
@@ -491,8 +518,8 @@ The query tool:
 answers what people actually ask ("what did this account do, and when"), not a supporting fact.
 It's the direct fit for the anchor use case (a market maker reconciling their own account's full
 history against ground truth — see `[[clio-full-history-vs-rippled]]` reasoning: they wanted
-full-history rippled, not Clio, precisely because they needed to trust the completeness of an
-account's history). It's also provably better than Clio's/rippled's own opaque side-index, because
+full-history xrpld, not Clio, precisely because they needed to trust the completeness of an
+account's history). It's also provably better than Clio's/xrpld's own opaque side-index, because
 the underlying tx+meta blobs are already cryptographically anchored (`tx_tree.rs`) — the index is a
 deterministic, re-derivable, auditable computation over verified data, not just rows you have to
 trust. AccountRoot/lines/NFTs/order-book decoding remain real, valuable, and reuse the same
@@ -528,7 +555,7 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
 2. **Resolve the storage premise** (blocks Phase 2): quantify compressed delta size and
    decide the checkpoint strategy (per-chunk full state is too expensive). See Storage Estimate.
 
-3. **TX maps**: fetch transaction blobs (rippled `transaction.db` / tx SHAMap) so chunks carry
+3. **TX maps**: fetch transaction blobs (xrpld `transaction.db` / tx SHAMap) so chunks carry
    transactions, not just state deltas. Currently `tx_maps` is populated with empty `txns`.
 
 4. **Remove dead code**: `dat::scan_dat()` (the original sequential-scan PoC) is no longer used
@@ -541,7 +568,7 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
    ledger is currently only self-consistency-checked (recomputed from `ledger.db`'s own
    fields) — this can't catch a single diverged/amendment-blocked source serving an
    internally-consistent-but-wrong fork (the exact failure mode discussed in a Clio incident
-   where "clio trusts rippled data" with no cross-check led to corrupted ETL state from a
+   where "clio trusts xrpld data" with no cross-check led to corrupted ETL state from a
    diverging source). Close this by querying independent nodes' `ledger` RPC for the
    checkpoint's `ledger_hash` and requiring quorum agreement:
    - **Recent ledgers** (within any public node's retention window): query 2-3 independent
@@ -555,10 +582,10 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
      independent second FH source for cross-checks would need a self-hosted FH node or a
      non-Ripple-operated public FH provider.
 
-7. **Leaf-node (`AccountState`) hash verification** — ✅ done. A real rippled Docker
+7. **Leaf-node (`AccountState`) hash verification** — ✅ done. A real xrpld Docker
    snapshot (`xrpl-sensor` container, stopped but its volumes intact) turned out to still be
    available and was used to derive and confirm the formula: leaf nodes hash as
-   `SHA512half(content)` directly, no `HashPrefix` needed — rippled's on-disk payload
+   `SHA512half(content)` directly, no `HashPrefix` needed — xrpld's on-disk payload
    already embeds whatever it needs, the same pattern already known for transaction leaves.
    Confirmed against the *entire* real checkpoint (27,031,655 nodes: 7,912,690 inner +
    19,118,965 leaves), zero mismatches — not a sample. Implemented in
@@ -587,12 +614,21 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
    `collect_reachable_adaptive`), regardless of how many chunks the requested range spans.
    Added `--chunk-size` (default 10,000 ledgers); the export loop maintains a running
    `HashMap<Hash256, SHAMapNode>` across the whole run, applies each ledger's delta to it, and
-   at every chunk boundary snapshots the current map as that chunk's checkpoint (`write_chunk`
-   helper) instead of re-walking NuDB. Only the very first chunk's checkpoint costs a real walk.
+   at every chunk boundary snapshots the current map as that chunk's checkpoint (written via
+   `ChunkWriter`) instead of re-walking NuDB. Only the first chunk's checkpoint costs a real walk.
    Real-data run: 100 real mainnet ledgers, `--chunk-size 30` → 4 chunks, exactly one trie walk
    logged, all 4 chunks written; `xrla-import` verified the first chunk (real-walk checkpoint)
    and the last, partial chunk (in-memory-snapshot checkpoint, shorter-final-chunk edge case) —
    every account_hash, chained LedgerHash, and state-tree self-consistency check passed.
+
+   **2026-09-29 — `write_chunk` replaced by a streaming `ChunkWriter` (format v3).** The
+   snapshot-and-buffer design above held every `LedgerDelta` and `TxMap` for the current chunk
+   in memory until the boundary, then copied it all into one `Vec<u8>`. At real mainnet density
+   that OOM-killed a single 20k-ledger chunk at 121.6 GB RSS. Chunks are now streamed to disk
+   ledger-by-ledger with an incremental SHA-512 (`.tmp` + rename on success); only the running
+   `state` map is resident. Same 20k chunk now peaks at 18.3 GB. This required interleaving each
+   delta with its tx_map on disk — see `spec/chunk-format.md` v3 — because the v2 block layout
+   is fundamentally un-streamable. v2 chunks remain readable.
 
 10a. **Concurrent/batched NuDB reads for `collect_reachable`, adaptive concurrency** — ✅ done
     (2026-07-08), **hardened same day after an I/O-saturation incident** — see Phase 2 item 2 for
@@ -661,13 +697,13 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
 13. **`account_tx` decoder + index (2026-07-09; decoder ✅ 2026-07-28, index ⬜)**. See Phase 4
     "Two distinct query shapes" above for the full architecture and reasoning.
 
-    ✅ **Decoder done** — `xrla-common/src/meta_decode.rs`. A generic decoder for rippled's
+    ✅ **Decoder done** — `xrla-common/src/meta_decode.rs`. A generic decoder for xrpld's
     canonical binary STObject format that finds every `AccountID`-typed field at any nesting
     depth inside a `meta_blob`, plus `account_id_to_classic_address` (base58check r-address
     encoding). Deliberately type-driven rather than field-name-driven: it implements the
     type-level wire rules only, avoiding a hand-copied field-code table (the same class of
     silent, hard-to-spot error as the 2026-07-08 sparse-inner-node bit-order bug). Type codes
-    confirmed against rippled `SField.h` `SerializedTypeID` and `ripple-binary-codec`
+    confirmed against xrpld `SField.h` `SerializedTypeID` and `ripple-binary-codec`
     `definitions.json`.
 
     ✅ **Live query works, unindexed** — `xrla-inspect --account <r-address>` scans a chunk's
@@ -679,7 +715,7 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
     producing `account → [(ledger_seq, tx_hash), ...]` sorted by `ledger_seq`, written as a
     separate rebuildable sidecar file per archive range (not embedded in `.xrla` chunks). Needed
     because a live scan across a full-history archive is far slower than an indexed lookup — the
-    same reason rippled and Clio both maintain their own tx indexes rather than re-scanning.
+    same reason xrpld and Clio both maintain their own tx indexes rather than re-scanning.
 
     ✅ **Cross-checked against a live independent source, not just self-consistent.** Ran clean
     across all 1,236 real transactions in a real 10-ledger export (105277428–105277438) — zero
@@ -700,7 +736,7 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
     failure — this is exactly why the completeness gap matters more than it might otherwise.
 
 14. **AccountRoot/lines/NFTs/order-book decoder (secondary, after 13)**. Shared foundation: a raw
-    STObject binary parser (rippled's field-code binary format — does not exist anywhere in this
+    STObject binary parser (xrpld's field-code binary format — does not exist anywhere in this
     codebase yet). `AccountRoot` balance-at-ledger-N is the simplest case (single direct leaf
     lookup after replay-to-N). `account_lines`/`account_nfts` add an owned-object/directory walk
     (same replay-to-N, different object type + a linked-list walk). DEX order-book reconstruction

@@ -1,11 +1,13 @@
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256, Sha512};
 
 use crate::chunk::{
     Chunk, ChunkError, LedgerDelta, TxMap, TxRecord,
-    MAGIC_FOOTER, MAGIC_HEADER, FORMAT_VERSION,
+    MAGIC_FOOTER, MAGIC_HEADER, FORMAT_VERSION, FORMAT_VERSION_STREAMED,
 };
 use crate::shamap::{Hash256, NodeType, SHAMapDiff, SHAMapNode};
 
@@ -28,7 +30,7 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// Fields needed to independently recompute a ledger's LedgerHash.
-/// Mirrors rippled's LedgerHeader; source: libxrpl/protocol/LedgerHeader.cpp
+/// Mirrors xrpld's LedgerHeader; source: libxrpl/protocol/LedgerHeader.cpp
 /// `calculateLedgerHash()`, verified against real mainnet data.
 pub struct LedgerHashInput {
     pub seq: u32,
@@ -106,6 +108,127 @@ fn write_node_list(w: &mut impl Write, mut nodes: Vec<SHAMapNode>) -> Result<()>
         write_node(w, node)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Streaming chunk writer
+// ---------------------------------------------------------------------------
+
+/// Writes a chunk directly to disk piece by piece (header, then checkpoint, then each
+/// delta/tx_map as it's produced) instead of buffering the whole chunk body in memory
+/// and writing it in one shot. Bytes are hashed as they're written so the running
+/// SHA-512/half never needs the full body materialized either.
+///
+/// Writes to `<final_path>` with a `.tmp` suffix and renames to the real name only in
+/// `finish()`, so a mid-write crash (OOM, kill, disk full) never leaves a corrupt file
+/// at the final name — `Drop` cleans up the temp file if `finish()` was never reached.
+///
+/// Emits format v3 (`FORMAT_VERSION_STREAMED`): same fields as v2, but each ledger's delta
+/// is followed immediately by its tx_map instead of all deltas preceding all tx_maps. That
+/// reordering is what makes streaming possible at all — under v2 you cannot finish the delta
+/// block until the last ledger's tx_map has also been computed, so one side always has to be
+/// buffered. `serialize_chunk` still emits v2; `deserialize_chunk` reads both.
+pub struct ChunkWriter {
+    inner: BufWriter<File>,
+    tmp_path: PathBuf,
+    final_path: PathBuf,
+    hasher: Option<Sha512>,
+    chunk_hash_offset: u64,
+    finished: bool,
+}
+
+impl ChunkWriter {
+    pub fn create(
+        final_path: PathBuf,
+        network_id: u32,
+        start_ledger: u32,
+        end_ledger: u32,
+        checkpoint_hash: Hash256,
+    ) -> Result<Self> {
+        let mut tmp_path = final_path.clone();
+        tmp_path.as_mut_os_string().push(".tmp");
+        let file = File::create(&tmp_path)?;
+        let mut inner = BufWriter::new(file);
+
+        write_bytes(&mut inner, MAGIC_HEADER)?;
+        write_u8(&mut inner, FORMAT_VERSION_STREAMED)?;
+        write_u32be(&mut inner, network_id)?;
+        write_u32be(&mut inner, start_ledger)?;
+        write_u32be(&mut inner, end_ledger)?;
+        write_bytes(&mut inner, &checkpoint_hash)?;
+        let chunk_hash_offset = inner.stream_position()?;
+        write_bytes(&mut inner, &[0u8; 32])?; // placeholder, filled in by finish()
+
+        Ok(Self {
+            inner,
+            tmp_path,
+            final_path,
+            hasher: Some(Sha512::new()),
+            chunk_hash_offset,
+            finished: false,
+        })
+    }
+
+    fn body(&mut self, buf: &[u8]) -> Result<()> {
+        self.hasher.as_mut().expect("hasher taken before finish").update(buf);
+        self.inner.write_all(buf)?;
+        Ok(())
+    }
+
+    /// Write the checkpoint: full SHAMap state at start_ledger, sorted by hash (the
+    /// on-disk order the format requires). Takes references so the caller doesn't need
+    /// a second, cloned copy of every node just to hand it to this call.
+    pub fn write_checkpoint(&mut self, nodes: &mut [&SHAMapNode]) -> Result<()> {
+        nodes.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let mut buf = Vec::new();
+        write_u32be(&mut buf, nodes.len() as u32)?;
+        self.body(&buf)?;
+        for node in nodes.iter() {
+            buf.clear();
+            write_node(&mut buf, node)?;
+            self.body(&buf)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_delta(&mut self, delta: &LedgerDelta) -> Result<()> {
+        let mut buf = Vec::new();
+        write_delta(&mut buf, delta)?;
+        self.body(&buf)
+    }
+
+    pub fn write_tx_map(&mut self, tx_map: &TxMap) -> Result<()> {
+        let mut buf = Vec::new();
+        write_tx_map(&mut buf, tx_map)?;
+        self.body(&buf)
+    }
+
+    /// Write the footer, compute the real chunk_hash over everything written so far,
+    /// seek back to fill in the header's placeholder, then atomically rename the temp
+    /// file to its final name. Returns the computed chunk_hash.
+    pub fn finish(mut self) -> Result<Hash256> {
+        self.body(MAGIC_FOOTER)?;
+        let digest = self.hasher.take().expect("finish called twice").finalize();
+        let mut chunk_hash = [0u8; 32];
+        chunk_hash.copy_from_slice(&digest[..32]);
+
+        self.inner.flush()?;
+        self.inner.seek(SeekFrom::Start(self.chunk_hash_offset))?;
+        self.inner.write_all(&chunk_hash)?;
+        self.inner.flush()?;
+
+        fs::rename(&self.tmp_path, &self.final_path)?;
+        self.finished = true;
+        Ok(chunk_hash)
+    }
+}
+
+impl Drop for ChunkWriter {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = fs::remove_file(&self.tmp_path);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,7 +359,7 @@ pub fn deserialize_chunk(data: &[u8]) -> Result<Chunk, ChunkError> {
         return Err(ChunkError::InvalidMagic);
     }
     let version = read_u8(&mut r)?;
-    if version != FORMAT_VERSION {
+    if version != FORMAT_VERSION && version != FORMAT_VERSION_STREAMED {
         return Err(ChunkError::UnsupportedVersion(version));
     }
     let network_id   = read_u32be(&mut r)?;
@@ -258,19 +381,31 @@ pub fn deserialize_chunk(data: &[u8]) -> Result<Chunk, ChunkError> {
     // Checkpoint
     let checkpoint = read_node_list(&mut r)?;
 
-    // Deltas
     let delta_count = (end_ledger - start_ledger) as usize;
-    let mut deltas = Vec::with_capacity(delta_count);
-    for _ in 0..delta_count {
-        deltas.push(read_delta(&mut r)?);
-    }
-
-    // TX maps
-    let tx_map_count = (end_ledger - start_ledger + 1) as usize;
-    let mut tx_maps = Vec::with_capacity(tx_map_count);
-    for _ in 0..tx_map_count {
+    let tx_map_count = delta_count + 1;
+    let (deltas, tx_maps) = if version == FORMAT_VERSION_STREAMED {
+        // v3: checkpoint, tx_map[start], then (delta, tx_map) pairs for start+1..=end —
+        // written this way so the exporter never has to buffer a whole chunk in memory.
+        let mut deltas = Vec::with_capacity(delta_count);
+        let mut tx_maps = Vec::with_capacity(tx_map_count);
         tx_maps.push(read_tx_map(&mut r)?);
-    }
+        for _ in 0..delta_count {
+            deltas.push(read_delta(&mut r)?);
+            tx_maps.push(read_tx_map(&mut r)?);
+        }
+        (deltas, tx_maps)
+    } else {
+        // v2: all deltas as one block, then all tx_maps as a second block.
+        let mut deltas = Vec::with_capacity(delta_count);
+        for _ in 0..delta_count {
+            deltas.push(read_delta(&mut r)?);
+        }
+        let mut tx_maps = Vec::with_capacity(tx_map_count);
+        for _ in 0..tx_map_count {
+            tx_maps.push(read_tx_map(&mut r)?);
+        }
+        (deltas, tx_maps)
+    };
 
     // Footer
     let footer = read_exact(&mut r, 4)?;
@@ -356,4 +491,122 @@ fn read_tx_map(r: &mut impl Read) -> Result<TxMap, ChunkError> {
         parent_close_time, close_time, close_time_resolution, close_flags,
         txns,
     })
+}
+
+#[cfg(test)]
+mod chunk_writer_tests {
+    use super::*;
+    use crate::chunk::NETWORK_MAINNET;
+
+    fn node(tag: u8) -> SHAMapNode {
+        let mut hash = [0u8; 32];
+        hash[31] = tag;
+        SHAMapNode {
+            hash,
+            node_type: NodeType::AccountState,
+            content: vec![tag; 5],
+        }
+    }
+
+    fn tx_map(seq: u32) -> TxMap {
+        TxMap {
+            ledger_seq: seq,
+            ledger_hash: [seq as u8; 32],
+            account_hash: [(seq + 1) as u8; 32],
+            drops: 100_000_000,
+            parent_close_time: 1000,
+            close_time: 1004,
+            close_time_resolution: 10,
+            close_flags: 0,
+            txns: vec![TxRecord {
+                tx_hash: [(seq + 2) as u8; 32],
+                tx_blob: vec![0xAA, 0xBB],
+                meta_blob: vec![0xCC],
+            }],
+        }
+    }
+
+    #[test]
+    fn streamed_chunk_round_trips_through_deserialize_chunk() {
+        let dir = std::env::temp_dir().join(format!(
+            "xrla_chunkwriter_test_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("test_chunk.xrla");
+
+        let n0 = node(1);
+        let n1 = node(2);
+        let n2 = node(3);
+        let checkpoint_hash = [0x11u8; 32];
+
+        let mut writer =
+            ChunkWriter::create(final_path.clone(), NETWORK_MAINNET, 100, 102, checkpoint_hash)
+                .unwrap();
+        {
+            let mut refs = vec![&n1, &n0];
+            writer.write_checkpoint(&mut refs).unwrap();
+        }
+        writer.write_tx_map(&tx_map(100)).unwrap();
+        writer
+            .write_delta(&LedgerDelta {
+                ledger_seq: 101,
+                diff: SHAMapDiff {
+                    added: vec![n2.clone()],
+                    deleted: vec![n0.hash],
+                },
+            })
+            .unwrap();
+        writer.write_tx_map(&tx_map(101)).unwrap();
+        writer
+            .write_delta(&LedgerDelta {
+                ledger_seq: 102,
+                diff: SHAMapDiff { added: vec![], deleted: vec![] },
+            })
+            .unwrap();
+        writer.write_tx_map(&tx_map(102)).unwrap();
+        let returned_hash = writer.finish().unwrap();
+
+        assert!(!final_path.with_extension("xrla.tmp").exists());
+        assert!(final_path.exists());
+
+        let bytes = fs::read(&final_path).unwrap();
+        let chunk = deserialize_chunk(&bytes).unwrap();
+
+        assert_eq!(chunk.network_id, NETWORK_MAINNET);
+        assert_eq!(chunk.start_ledger, 100);
+        assert_eq!(chunk.end_ledger, 102);
+        assert_eq!(chunk.checkpoint_hash, checkpoint_hash);
+        assert_eq!(chunk.chunk_hash, returned_hash);
+        assert_eq!(chunk.checkpoint.len(), 2);
+        // deserialize_chunk verifies chunk_hash internally already; sanity-check it matches.
+        assert_eq!(chunk.deltas.len(), 2);
+        assert_eq!(chunk.tx_maps.len(), 3);
+        assert_eq!(chunk.deltas[0].ledger_seq, 101);
+        assert_eq!(chunk.deltas[0].diff.added[0].hash, n2.hash);
+        assert_eq!(chunk.deltas[0].diff.deleted[0], n0.hash);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dropping_writer_without_finish_removes_tmp_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "xrla_chunkwriter_droptest_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let final_path = dir.join("abandoned.xrla");
+
+        {
+            let _writer =
+                ChunkWriter::create(final_path.clone(), NETWORK_MAINNET, 1, 1, [0u8; 32]).unwrap();
+            // dropped without calling finish()
+        }
+
+        assert!(!final_path.exists());
+        assert!(!final_path.with_extension("xrla.tmp").exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }

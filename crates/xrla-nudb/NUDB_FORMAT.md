@@ -1,4 +1,4 @@
-# NuDB dat file format (rippled 3.2.0)
+# NuDB dat file format (xrpld 3.2.0)
 
 Empirically determined by scanning a live mainnet NuDB dat file (5.8 GB, 447 ledgers, ledgers 105271056–105271502).
 
@@ -45,7 +45,7 @@ Each record is tightly packed, no inter-record padding:
 [N bytes]  payload
 ```
 
-Rare in modern rippled. payload = SHAMap node wire bytes.
+Rare in modern xrpld. payload = SHAMap node wire bytes.
 
 ### 0x01 — LZ4 compressed
 
@@ -73,7 +73,7 @@ N = popcount(mask). **Branch bit order is big-endian: branch slot `s` (0..15) is
 full 512-byte inner: walk `bit = 0x8000` down to `0x0001`; for each set bit consume the next
 32-byte hash into that slot, otherwise leave it zero.
 
-This matches rippled `nodestore/detail/codec.h` `nodeobject_decompress` case 2
+This matches xrpld `nodestore/detail/codec.h` `nodeobject_decompress` case 2
 (`std::uint16_t bit = 0x8000; for (int i = 16; i--; bit >>= 1) if (mask & bit) ...`).
 
 > ⚠️ It is NOT `mask & (1 << s)` (low bit = slot 0). That reversed mapping decodes ~93% of sparse
@@ -91,7 +91,7 @@ Slot with all-zero hash = empty child slot.
 
 ## NodeObjectType (byte at decoded[8])
 
-From `rippled include/xrpl/nodestore/NodeObject.h`:
+From `xrpld include/xrpl/nodestore/NodeObject.h`:
 
 | Value | Name            | XRLA wire type       |
 |-------|-----------------|----------------------|
@@ -145,7 +145,7 @@ offset 10:  [8]  uid
 offset 18:  [8]  appnum
 offset 26:  [2]  key_size = 32
 offset 28:  [8]  salt        (u64 BE)
-offset 36:  [8]  pepper      (u64 BE)
+offset 36:  [8]  pepper      (u64 BE) = xxh64(salt.to_le_bytes(), salt)  ← SEE WARNING BELOW
 offset 44:  [2]  block_size  (u16 BE) = 4096
 offset 46:  [2]  load_factor (u16 BE)
 ... zero padding to block_size ...
@@ -167,7 +167,7 @@ count × entry, each 18 bytes, sorted ascending by hash:
 
 Bucket capacity = `(block_size - 8) / 18` = 227 entries for block_size 4096.
 
-### Hashing (empirically verified against rippled 3.2.0)
+### Hashing (empirically verified against xrpld 3.2.0)
 
 ```
 nhash  = xxh64(key, seed=salt) >> 16          (NuDB's effective 48-bit hash)
@@ -176,10 +176,18 @@ bucket = nhash % modulus
 if bucket >= num_buckets { bucket -= modulus / 2 }
 ```
 
-Both the bucket index **and** the stored 6-byte entry hash use `nhash`. `pepper` is part of
-the header but is not needed for read-side bucket placement. After matching a candidate by
-the 48-bit `nhash` prefix, verify the full 32-byte key from the `.dat` record (prefix
-collisions occur).
+Both the bucket index **and** the stored 6-byte entry hash use `nhash`. After matching a
+candidate by the 48-bit `nhash` prefix, verify the full 32-byte key from the `.dat` record
+(prefix collisions occur).
+
+> ⚠️ **`pepper` is not optional for writers.** It is unused for *read-side* bucket placement,
+> which is why an earlier revision of this document called it "not needed" — and that phrasing
+> directly caused a real bug: our writer emitted `xxh64(&[], salt)` and every store it produced
+> was rejected by real xrpld with `hash_mismatch`, because libnudb's `verify()` recomputes
+> `pepper<Hasher>(salt)` from the header's own salt and refuses to open the file on mismatch.
+> Any writer MUST emit `pepper = xxh64(salt.to_le_bytes(), salt)` — note the salt is hashed as
+> **little-endian bytes** even though it is *stored* in the header big-endian. See
+> `writer.rs:write_key_header`. Fixed 2026-09-28; a real xrpld has since booted from our output.
 
 ### Spill buckets
 
@@ -195,7 +203,7 @@ spill chain must still be followed for correctness.
 
 ### online_delete = two live shards
 
-rippled's `online_delete` keeps **two** NuDB databases live at once during rotation
+xrpld's `online_delete` keeps **two** NuDB databases live at once during rotation
 (e.g. `rippledb.f380/` and `rippledb.fccd/`). The complete state spans both, so a reader must
 try each shard in turn. `NuDBReader::open` takes a list of `.dat` paths for this reason.
 

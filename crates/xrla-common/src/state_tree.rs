@@ -14,7 +14,7 @@
 ///   NuDB payload has the prefix stripped (see `xrla_nudb::dat`), so it's re-added before
 ///   hashing. Confirmed against all 7,912,690 inner nodes in a real mainnet checkpoint.
 /// - **Leaf nodes** (`AccountState`, and by the same evidence `Transaction`/
-///   `TransactionWithMeta`): `SHA512half(content)` directly, no prefix. rippled's on-disk
+///   `TransactionWithMeta`): `SHA512half(content)` directly, no prefix. xrpld's on-disk
 ///   payload already embeds whatever it needs (confirmed empirically — trying a
 ///   `HashPrefix::leafNode "MLN\0"`-prepended variant against real data produced zero
 ///   matches, while hashing content as-is matched every single time), the same pattern

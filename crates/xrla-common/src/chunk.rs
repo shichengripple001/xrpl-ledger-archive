@@ -8,6 +8,15 @@ pub const MAGIC_FOOTER: &[u8; 4] = b"ENDX";
 /// "Verification without full history" in spec/chunk-format.md). Version 1 chunks are
 /// not readable by this version — never shipped past this repo, so no compat shim needed.
 pub const FORMAT_VERSION: u8 = 2;
+/// Version 3: same fields as v2, but the body interleaves each ledger's delta with its
+/// tx_map (checkpoint, tx_map[start], delta[start+1], tx_map[start+1], ...) instead of
+/// writing all deltas as one block followed by all tx_maps as a second block. This lets
+/// the exporter stream a chunk straight to disk ledger-by-ledger without buffering the
+/// whole chunk in memory first — the v2 layout can't do that, since "all deltas" isn't
+/// known to be finished until the last ledger's tx_map is also already computed, but
+/// tx_maps can't be written until every delta is already on disk. v2 files remain
+/// readable — `deserialize_chunk` dispatches on the version byte.
+pub const FORMAT_VERSION_STREAMED: u8 = 3;
 
 pub const NETWORK_MAINNET: u32 = 1;
 pub const NETWORK_TESTNET: u32 = 2;

@@ -29,7 +29,7 @@ pub fn calculate_tx_id(tx_blob: &[u8]) -> Hash256 {
     sha512half(&buf)
 }
 
-/// Rippled variable-length encoding: 1-byte (<=192), 2-byte (193..=12480),
+/// Xrpld variable-length encoding: 1-byte (<=192), 2-byte (193..=12480),
 /// 3-byte (12481..) length prefixes. Inverse of the `read_vl` used when parsing leaves.
 fn write_vl(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
@@ -65,7 +65,7 @@ fn nibble(key: &Hash256, depth: usize) -> usize {
 
 /// Rebuild the transaction SHAMap from a ledger's transaction records.
 /// Returns (root_hash, all_nodes). An empty ledger has root_hash == ZERO_HASH and no nodes
-/// (matches rippled: an empty tx tree's TransSetHash is the zero hash, not a hashed empty inner).
+/// (matches xrpld: an empty tx tree's TransSetHash is the zero hash, not a hashed empty inner).
 pub fn build_tx_tree(txns: &[TxRecord]) -> (Hash256, Vec<SHAMapNode>) {
     if txns.is_empty() {
         return (ZERO_HASH, Vec::new());

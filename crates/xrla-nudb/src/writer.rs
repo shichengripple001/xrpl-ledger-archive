@@ -5,8 +5,10 @@
 /// insert/grow algorithm — it sizes the bucket table once for the full entry set instead
 /// of growing it via linear hashing as inserts happen live. The on-disk layout it produces
 /// (headers, bucket format, spill-chain format) matches what `keyfile::Shard` reads, and is
-/// validated by reading a written store back through that same reader. It has NOT been
-/// tested against a real rippled process — see NUDB_FORMAT.md for the format this mirrors.
+/// validated by reading a written store back through that same reader. As of 2026-09-28 a
+/// real xrpld process also opens, boots from, and correctly serves a store written here —
+/// see NUDB_FORMAT.md for the format this mirrors, including the `pepper` warning (getting
+/// that field wrong is silently fatal: xrpld rejects the store with `hash_mismatch`).
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -257,12 +259,12 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Round-trips real, rippled-produced node values (not synthetic bytes) through
+    /// Round-trips real, xrpld-produced node values (not synthetic bytes) through
     /// encode_wire_to_value -> write_nudb_store -> Shard::fetch -> decode_value_to_wire,
     /// and asserts the wire bytes are unchanged.
     ///
-    /// Requires a real rippled NuDB shard on disk:
-    ///   RIPPLED_DAT=/path/to/nudb.dat cargo test --workspace -- --ignored real_snapshot
+    /// Requires a real xrpld NuDB shard on disk:
+    ///   XRPLD_DAT=/path/to/nudb.dat cargo test --workspace -- --ignored real_snapshot
     #[test]
     #[ignore]
     fn real_snapshot_roundtrip_via_writer() {
@@ -270,7 +272,7 @@ mod tests {
         use std::io::Read;
         use xrla_common::shamap::SHAMapNode;
 
-        let dat_path_str = std::env::var("RIPPLED_DAT").expect("set RIPPLED_DAT to a real nudb.dat");
+        let dat_path_str = std::env::var("XRPLD_DAT").expect("set XRPLD_DAT to a real nudb.dat");
         let dat_path = std::path::Path::new(&dat_path_str);
 
         let mut f = File::open(dat_path).expect("open real nudb.dat");

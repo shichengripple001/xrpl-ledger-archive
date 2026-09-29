@@ -9,9 +9,9 @@ use xrla_common::shamap::{Hash256, InnerNode, SHAMapDiff, SHAMapNode, ZERO_HASH}
 use crate::dat::decode_value_to_wire;
 use crate::keyfile::Shard;
 
-/// Reads SHAMap nodes from a rippled NuDB store via O(1) .key file lookups.
+/// Reads SHAMap nodes from a xrpld NuDB store via O(1) .key file lookups.
 ///
-/// rippled's online_delete keeps two NuDB databases live at once during rotation, and the
+/// xrpld's online_delete keeps two NuDB databases live at once during rotation, and the
 /// complete state tree spans both. Each `--dat` path is paired with its sibling `nudb.key`
 /// and tried in order on every lookup.
 pub struct NuDBReader {
@@ -296,7 +296,7 @@ impl NuDBReader {
     /// Empty if `tx_root` is the zero hash (a ledger with no transactions).
     ///
     /// Transaction-with-metadata leaf content is `['SND\0'][VL(tx)][VL(meta)][32-byte txid]`
-    /// (rippled SHAMapTreeNode::serializeWithPrefix for the tx-with-meta map). The txid is
+    /// (xrpld SHAMapTreeNode::serializeWithPrefix for the tx-with-meta map). The txid is
     /// the SHAMap key and equals SHA512half(HashPrefix::transactionID + tx).
     pub fn collect_transactions(&self, tx_root: &Hash256) -> Result<Vec<TxRecord>> {
         let mut out = Vec::new();
@@ -493,7 +493,7 @@ fn parse_tx_leaf(content: &[u8]) -> Result<TxRecord> {
     Ok(TxRecord { tx_hash, tx_blob, meta_blob })
 }
 
-/// rippled variable-length (VL) length prefix decoder.
+/// xrpld variable-length (VL) length prefix decoder.
 /// Returns (length, bytes_consumed). See Serializer::addVL / ripple protocol.
 fn read_vl(b: &[u8]) -> Result<(usize, usize)> {
     let b0 = *b.first().ok_or_else(|| anyhow::anyhow!("vl: truncated"))? as usize;
@@ -704,9 +704,9 @@ mod tests {
     /// was originally derived and confirmed: tried candidate formulas against real nodes
     /// until one matched every single one.
     ///
-    /// Requires real rippled NuDB shards on disk:
-    ///   RIPPLED_DAT_PATHS=/path/shard0/nudb.dat,/path/shard1/nudb.dat \
-    ///   RIPPLED_ACCOUNT_HASH=<hex AccountSetHash for that checkpoint ledger> \
+    /// Requires real xrpld NuDB shards on disk:
+    ///   XRPLD_DAT_PATHS=/path/shard0/nudb.dat,/path/shard1/nudb.dat \
+    ///   XRPLD_ACCOUNT_HASH=<hex AccountSetHash for that checkpoint ledger> \
     ///   cargo test --package xrla-nudb --lib -- --ignored real_snapshot_state_nodes --nocapture
     ///
     /// Last run against a real mainnet checkpoint (ledger 105277428): 7,912,690 inner +
@@ -714,12 +714,12 @@ mod tests {
     #[test]
     #[ignore]
     fn real_snapshot_state_nodes_self_verify() {
-        let dat_paths: Vec<PathBuf> = std::env::var("RIPPLED_DAT_PATHS")
-            .expect("set RIPPLED_DAT_PATHS (comma-separated .dat paths)")
+        let dat_paths: Vec<PathBuf> = std::env::var("XRPLD_DAT_PATHS")
+            .expect("set XRPLD_DAT_PATHS (comma-separated .dat paths)")
             .split(',')
             .map(PathBuf::from)
             .collect();
-        let root_hex = std::env::var("RIPPLED_ACCOUNT_HASH").expect("set RIPPLED_ACCOUNT_HASH");
+        let root_hex = std::env::var("XRPLD_ACCOUNT_HASH").expect("set XRPLD_ACCOUNT_HASH");
         let root_bytes = hex::decode(root_hex.trim()).expect("valid hex");
         let root: Hash256 = root_bytes.try_into().expect("32 bytes");
 

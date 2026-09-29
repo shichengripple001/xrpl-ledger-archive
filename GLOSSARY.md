@@ -27,7 +27,7 @@ the delta, not the whole state, per ledger is what makes a chunk far smaller tha
 **Checkpoint sparsity**
 The open design gap where every `.xrla` chunk bundles its own full checkpoint, so
 downloading many small chunks still means downloading many full-state copies. See
-[DESIGN_NOTES.md](DESIGN_NOTES.md) and the README "Open" section. Not yet solved —
+[PLAN.md](PLAN.md) and the README "Open" section. Not yet solved —
 intentionally out of scope for the current import/verification work.
 
 **Transaction map (TX Map)**
@@ -37,9 +37,11 @@ that ledger's full `LedgerHash`. See "TX Map Entry" in
 [spec/chunk-format.md](spec/chunk-format.md).
 
 **Chunk hash**
-`SHA512half` of the entire chunk body (checkpoint + deltas + tx_maps + footer). Any single
-byte changed anywhere in the file changes this hash, so it's the cheapest possible tamper
-check — verified first, before any expensive replay work.
+`SHA512half` of the entire chunk body — every byte after the header, whatever order that
+body is laid out in (v2 groups all deltas then all tx_maps; v3 interleaves them per ledger —
+see [spec/chunk-format.md](spec/chunk-format.md)). Any single byte changed anywhere in the
+file changes this hash, so it's the cheapest possible tamper check — verified first, before
+any expensive replay work.
 
 **Checkpoint hash**
 The `LedgerHash` of the checkpoint ledger (the first ledger in the chunk's range), stored
@@ -52,7 +54,7 @@ order to reconstruct every intermediate ledger's state, re-deriving each one's s
 and comparing it to the ledger's stored `account_hash`. Implemented in
 `replay_chunk` (`crates/xrla-import/src/main.rs`).
 
-## XRPL / rippled concepts
+## XRPL / xrpld concepts
 
 **Ledger**
 One "block" in XRPL's terminology — a fully-closed, validated snapshot of the network at a
@@ -87,7 +89,7 @@ ledger. This is what makes tampering with one ledger break every hash after it (
 
 **drops**
 XRP's smallest unit; 1,000,000 drops = 1 XRP. A ledger's `drops` field (`TotalCoins` in
-rippled) is the total XRP in existence at that ledger — it only ever decreases, by the
+xrpld) is the total XRP in existence at that ledger — it only ever decreases, by the
 amount of transaction fees burned (destroyed, not paid to anyone) in that ledger.
 
 **close_time / parent_close_time / close_time_resolution / close_flags**
@@ -123,9 +125,9 @@ as the transaction's public ID and as the key that determines its placement in t
 transaction SHAMap.
 
 **tx_blob / meta_blob**
-The raw, rippled binary-serialized bytes of a transaction and of its execution metadata
+The raw, xrpld binary-serialized bytes of a transaction and of its execution metadata
 (what actually happened when it ran — balance changes, created/deleted objects, etc.),
-respectively. Opaque hex outside of a full rippled binary-format decoder; `xrla-inspect
+respectively. Opaque hex outside of a full xrpld binary-format decoder; `xrla-inspect
 --tx` prints them as-is.
 
 **Genesis ledger**
@@ -140,21 +142,21 @@ having retained ledger N's own data.
 
 **Validated ledger**
 A ledger that has reached consensus and been confirmed final by a quorum of the network's
-trusted validators (its UNL). rippled's `ledger` RPC reports `"validated": true` for such
+trusted validators (its UNL). xrpld's `ledger` RPC reports `"validated": true` for such
 ledgers — this is the network's own attestation that a hash is real, not merely one node's
 local record.
 
 ## NuDB / storage concepts
 
 **NuDB**
-The on-disk key-value store rippled uses for ledger object storage (a `.dat` file with the
+The on-disk key-value store xrpld uses for ledger object storage (a `.dat` file with the
 actual records + a `.key` file with a hash-bucket index for O(1) lookup). See
 [crates/xrla-nudb/NUDB_FORMAT.md](crates/xrla-nudb/NUDB_FORMAT.md) for the full format
 (headers, bucket layout, spill chains, hashing scheme) as reverse-engineered and verified
-against real rippled databases.
+against real xrpld databases.
 
 **online_delete / shard rotation**
-rippled's mechanism for bounding disk usage by periodically deleting old ledger data. It
+xrpld's mechanism for bounding disk usage by periodically deleting old ledger data. It
 rotates between two live NuDB databases at once, so a consistent read of "current state"
 may need to check both — `xrla-export --dat` accepts multiple `.dat` paths for this reason.
 
@@ -163,10 +165,10 @@ NuDB's overflow mechanism: when a hash bucket has more entries than fit in one b
 entries are chained into overflow records stored in the `.dat` file itself, linked from the
 bucket via a spill pointer.
 
-**History Sharding (rippled, removed)**
-A now-removed rippled feature (dropped in v2.3.0) that split full history into fixed
+**History Sharding (xrpld, removed)**
+A now-removed xrpld feature (dropped in v2.3.0) that split full history into fixed
 ledger-range "shards," each backed by its own NuDB database. Discussed at length in
-[DESIGN_NOTES.md](DESIGN_NOTES.md) as prior art this project's content-addressed,
+[PLAN.md](PLAN.md) as prior art this project's content-addressed,
 delta-encoded design was built to avoid repeating (the design flaw being range/time-based
 bucketing misaligned with power-law object access, causing redundant re-serialization of
 unchanged objects across shard boundaries).
@@ -174,7 +176,7 @@ unchanged objects across shard boundaries).
 ## Tooling
 
 **`xrla-export`**
-Reads a rippled NuDB store + `ledger.db` directly (no running rippled process, no RPC) and
+Reads a xrpld NuDB store + `ledger.db` directly (no running xrpld process, no RPC) and
 writes a `.xrla` chunk for a given ledger range.
 
 **`xrla-import`**

@@ -1,6 +1,7 @@
 # XRPL Ledger Archive — Chunk Format Specification
 
-Version: 2  
+Version: 3 (v2 chunks remain readable — `deserialize_chunk` dispatches on the header's
+version byte)  
 Status: DRAFT
 
 > Version 2 added `account_hash`, `drops`, and the close-time fields to each TX Map Entry
@@ -8,6 +9,27 @@ Status: DRAFT
 > contents alone. Version 1 was never distributed outside this repo, so there is no
 > compatibility shim — bump this number again, and add one, the next time a breaking field
 > change happens after this format has real consumers.
+
+> **Version 3** (2026-09-29) changed the body layout from two contiguous blocks (all DELTAS,
+> then all TX_MAPS) to interleaved per-ledger pairs (checkpoint, TX_MAP[start], then
+> (DELTA, TX_MAP) for each ledger start+1..end). No fields changed — only the order bytes
+> appear in. This exists so `xrla-export` can stream a chunk straight to disk as it computes
+> each ledger, instead of buffering the whole chunk (every delta and every transaction blob
+> for the entire range) in memory before writing anything. The old block layout can't do
+> that: you don't know "all deltas are done" until the *last* ledger's tx_map is also already
+> computed, but tx_maps can't be written until every delta is already on disk — so something
+> has to be fully buffered either way under the v2 layout. Interleaving removes that
+> requirement entirely; the exporter only ever needs the current SHAMap state resident, not
+> the accumulated per-ledger output. Measured on a real 20,000-ledger mainnet range: peak
+> RSS dropped from 121.6 GB (OOM-killed under v2's block layout) to 18.3 GB under v3.
+> **v3 does not change how many bytes a chunk takes** — identical content, identical size,
+> only reordered. What it changes is which chunk shapes are *reachable*: a single 20,000-ledger
+> chunk is 38.5 GB versus 51.3 GB for the same ledgers split into two 10k chunks (one
+> checkpoint instead of two), and before v3 that single-chunk shape simply OOM-killed. The
+> size saving belongs to using fewer, wider chunks; v3 is what makes that affordable.
+> v2 files (including ones already produced) remain fully readable; `FORMAT_VERSION` (2) and
+> `FORMAT_VERSION_STREAMED` (3) are both accepted by `deserialize_chunk`, dispatching to the
+> layout that version wrote.
 
 ---
 
@@ -26,12 +48,27 @@ All node lists within a section are sorted ascending by node hash.
 
 ## File Layout
 
+**v2 layout** (`version` byte = 2): two contiguous blocks, deltas fully before tx_maps.
+
 ```
-[HEADER]       fixed size, 85 bytes
+[HEADER]       fixed size, 81 bytes
 [CHECKPOINT]   variable
 [DELTAS]       variable, one entry per ledger from start+1 to end
 [TX_MAPS]      variable, one entry per ledger from start to end
 [FOOTER]       fixed size, 4 bytes
+```
+
+**v3 layout** (`version` byte = 3): interleaved, one (delta, tx_map) pair per ledger after
+the checkpoint's own tx_map. Same field definitions as v2 (below) — only the order changes.
+
+```
+[HEADER]           fixed size, 81 bytes
+[CHECKPOINT]       variable
+[TX_MAP(start)]    variable — the checkpoint ledger's own transactions
+[DELTA(start+1)]   variable
+[TX_MAP(start+1)]  variable
+...                (repeated for every ledger from start+1 to end)
+[FOOTER]           fixed size, 4 bytes
 ```
 
 ---
@@ -41,7 +78,7 @@ All node lists within a section are sorted ascending by node hash.
 | Field            | Type      | Size | Description                                      |
 |------------------|-----------|------|--------------------------------------------------|
 | magic            | bytes     | 4    | 0x58524C41 ("XRLA")                              |
-| version          | uint8     | 1    | Format version = 1                               |
+| version          | uint8     | 1    | Format version: 2 (block layout) or 3 (interleaved) |
 | network_id       | uint32    | 4    | 1 = mainnet, 2 = testnet, 3 = devnet             |
 | start_ledger     | uint32    | 4    | First ledger sequence in this chunk              |
 | end_ledger       | uint32    | 4    | Last ledger sequence in this chunk               |
@@ -82,6 +119,10 @@ Nodes are sorted ascending by `hash` (lexicographic byte order).
 One delta entry per ledger from `start_ledger + 1` through `end_ledger`.
 Entries appear in ascending ledger sequence order.
 
+In **v2** these form one contiguous block placed before all TX_MAPS. In **v3** each delta is
+immediately followed by that same ledger's TX Map Entry (see File Layout above). The entry
+format below is identical in both versions.
+
 ### Delta Entry
 
 | Field         | Type   | Size     | Description                                   |
@@ -109,10 +150,15 @@ Deleted nodes are sorted ascending by hash.
 > (`TransSetHash` tree) read directly from NuDB. Verified end-to-end: every `tx_hash` equals
 > `SHA512half(HashPrefix::transactionID + tx_blob)`, and each ledger's reconstructed tx-tree
 > root equals the on-chain `TransSetHash`. Each leaf's source content is
-> `['SND\0'][VL(tx_blob)][VL(meta_blob)][32-byte tx_hash]` (rippled `HashPrefix::txNode`).
+> `['SND\0'][VL(tx_blob)][VL(meta_blob)][32-byte tx_hash]` (xrpld `HashPrefix::txNode`).
 
 One entry per ledger from `start_ledger` through `end_ledger`.
 Entries appear in ascending ledger sequence order.
+
+In **v2** these form one contiguous block placed after all DELTAS. In **v3** the checkpoint
+ledger's entry comes first (right after the checkpoint), and every subsequent ledger's entry
+follows that ledger's delta (see File Layout above). The entry format below is identical in
+both versions.
 
 ### TX Map Entry
 
@@ -164,7 +210,7 @@ ledgers / 4,500 transactions):
   more items still share a prefix; a subtree with exactly one item stores that item
   directly as the leaf child, with no further chain beneath it.
 - An empty ledger's transaction tree root is `ZERO_HASH` directly (not a hashed empty
-  inner node), matching rippled.
+  inner node), matching xrpld.
 
 
 ### Transaction Record
@@ -191,10 +237,12 @@ Transactions within a ledger are sorted ascending by tx_hash.
 
 ## Verification Algorithm
 
-Implemented in `xrla-import` (`replay_chunk` in `crates/xrla-import/src/main.rs`) as of
-format version 2. To verify a chunk file:
+Implemented in `xrla-import` (`replay_chunk` in `crates/xrla-import/src/main.rs`). Parsing is
+version-aware (`deserialize_chunk` reads either layout into the same in-memory `Chunk`), so
+every step below applies unchanged to both v2 and v3 files. To verify a chunk file:
 
-1. Read header, check magic = "XRLA", version = 2
+1. Read header, check magic = "XRLA", version = 2 or 3 (this selects the body layout to
+   parse — see File Layout; it does not change any field's meaning)
 2. Compute SHA-512/half of bytes from after chunk_hash field to end of file
 3. Assert computed hash == header.chunk_hash
 4. Load checkpoint nodes into an in-memory SHAMap; assert the first TX_MAPS entry's
@@ -271,6 +319,12 @@ in Phase 1):
 
 Either way, checkpoints SHOULD be sparse (e.g. one per ~1M ledgers), with delta/tx streams
 referencing the nearest preceding checkpoint, so checkpoint bytes are not repeated per chunk.
+
+Measured cost of *not* doing this, on a real 20,000-ledger mainnet range (2026-09-29): one
+checkpoint + 20k deltas in a single v3 file = 38.5 GB, versus 51.3 GB for the same ledgers
+split into two 10k chunks that each carry their own checkpoint. At this density a mainnet
+checkpoint is ~13 GB (28.3M nodes, ~468 B/node), so every extra chunk boundary costs roughly
+that much — which is what makes sparse checkpointing worth the added indirection.
 
 ## Local Query Index (informative)
 

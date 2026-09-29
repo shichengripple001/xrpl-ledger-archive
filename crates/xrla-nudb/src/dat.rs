@@ -161,7 +161,7 @@ pub fn scan_dat(path: &Path) -> Result<HashMap<Hash256, Vec<u8>>> {
 
 /// Decode a NuDB stored value into SHAMap wire bytes (content + trailing type byte).
 ///
-/// This is the rippled-side codec: the NuDB *value* layout (codec byte + EncodedBlob).
+/// This is the xrpld-side codec: the NuDB *value* layout (codec byte + EncodedBlob).
 /// Used by key-file lookups (see keyfile.rs) which read the raw value from the .dat file.
 /// Returns None for ledger objects / unrecognised codecs (not part of the account SHAMap).
 pub fn decode_value_to_wire(value: &[u8]) -> Option<Vec<u8>> {
@@ -204,7 +204,7 @@ fn decode_full_inner(value: &[u8]) -> Option<Vec<u8>> {
 ///
 /// Branch mask uses big-endian bit numbering: branch slot `s` (0..15) is present iff
 /// `mask & (0x8000 >> s)`, and present hashes are packed in ascending slot order.
-/// This matches rippled NodeStore codec.h nodeobject_decompress (`bit = 0x8000; bit >>= 1`).
+/// This matches xrpld NodeStore codec.h nodeobject_decompress (`bit = 0x8000; bit >>= 1`).
 /// NOTE: NOT `mask & (1 << s)` — the bits are reversed relative to slot index.
 fn decode_sparse_inner(value: &[u8]) -> Option<Vec<u8>> {
     if value.len() < 3 {
@@ -252,7 +252,7 @@ fn decode_raw(value: &[u8]) -> Option<Vec<u8>> {
     encoded_blob_to_wire(&value[1..])
 }
 
-/// Convert an EncodedBlob (from rippled) to XRLA wire bytes.
+/// Convert an EncodedBlob (from xrpld) to XRLA wire bytes.
 ///
 /// EncodedBlob layout: [8 zeros][NodeObjectType (1 byte)][payload...]
 /// Wire bytes: [payload][XRLA type byte]
@@ -309,7 +309,7 @@ const HASH_PREFIX_INNER_NODE: [u8; 4] = [0x4D, 0x49, 0x4E, 0x00];
 /// simpler, and it reuses the already-verified `decode_raw`/`encoded_blob_to_wire` read
 /// path, so a value written here round-trips through `decode_value_to_wire` byte-for-byte.
 /// This has been validated by reading written stores back with `keyfile::Shard::fetch`;
-/// it has NOT been tested against a real rippled process.
+/// it has NOT been tested against a real xrpld process.
 pub fn encode_wire_to_value(content: &[u8], node_type: &NodeType) -> Vec<u8> {
     let mut value = Vec::with_capacity(1 + 8 + 1 + content.len() + 4);
     value.push(CODEC_RAW);
