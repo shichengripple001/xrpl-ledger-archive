@@ -82,9 +82,12 @@ breaks out the non-NodeStore files:
 
 **Do not extrapolate archive size from a recent-ledger sample.** Our measured density on the
 20k ledgers immediately before the current tip is ~1.4 MB/ledger; scaling that across 107.3M
-ledgers predicts ~206 TB, roughly 6x the real 32–35 TB. The lifetime average is ~326 KB/ledger
-(35 TB ÷ 107.3M) because early mainnet years were nearly empty — closer to our PoC-network
-test than to today's traffic. Recent rate ≈ 4.3x the lifetime average.
+ledgers predicts ~206 TB, roughly 6x the real ~32–35 TB. These three figures (33.5 TB on
+2026-07-08, 32 TB and separately ~35 TB on 2026-09-29, from different hosts) are not in
+tension — a full-history node grows continuously (~12 GB/day, established above), so
+33.5 TB + ~83 days × 12 GB/day ≈ 34.5 TB lands right in that range. The lifetime average is
+~310-330 KB/ledger (32-35 TB ÷ 107.3M) because early mainnet years were nearly empty — closer
+to our PoC-network test than to today's traffic. Recent rate ≈ 4.3-4.5x the lifetime average.
 
 ---
 
@@ -210,11 +213,13 @@ below):
 | 10,000 ledgers | one v2 chunk | 24.87 GB | 3m55s | 96 GB |
 | 20,000 ledgers | two v2 10k chunks | 51.33 GB | 10m52s | 107 GB |
 | 20,000 ledgers | one v2 chunk | — **OOM-killed** | — | 121.6 GB (killed) |
-| 20,000 ledgers | one **v3** chunk | **38.5 GB** | 7m35s | **18.3 GB** |
+| 20,000 ledgers | one **v3** chunk | **41.35 GB** | 7m35s | **18.3 GB** |
 
 Density at the current tip: **~141 txns/ledger**, ~2,620 changed state nodes/ledger, ~1.4 MB/ledger
-incremental. A mainnet checkpoint is ~13 GB (28.3M nodes, ~468 B/node) — so splitting a range into
-two chunks costs an extra ~13 GB of duplicated checkpoint, which is why the two-chunk run is
+incremental. Splitting a 20k range into two 10k chunks costs an extra ~10 GB of duplicated
+checkpoint (measured directly: chunk1 + chunk2 − single = 9.98 GB — not the ~13 GB a naive
+"total bytes / total nodes" average would suggest; delta content and checkpoint content don't
+average the same bytes/node, so that heuristic overestimates by ~30%), which is why the two-chunk run is
 *larger* than the single-chunk one covering identical ledgers.
 
 ### The OOM, and the format change that fixed it
@@ -241,6 +246,87 @@ cause was reading `nudb.dat`/`nudb.key` while `xrpld` was concurrently appending
 hash buckets. Our `NuDBReader` is not xrpld's own reader and does not tolerate a live writer.
 Stopping `xrpld` made the identical range export cleanly. A spurious "node not found" here means
 a race, not missing history.
+
+---
+
+## Real-mainnet reseed: `xrla-import` had the same OOM bug, twice (2026-09-29/30)
+
+Repeated the earlier PoC-network proof — erase a node's db, reseed purely from `xrla-import`
+output, confirm it catches up and serves the reseeded range — this time on the mainnet-connected
+node (`xrpld-poc-fh-usw2-01`), importing the real 20,000-ledger v3 chunk from the section above.
+
+### Bug 1: the read side (`ChunkReader`, fixed 2026-09-29)
+
+The first attempt **OOM-killed at 127.46 GB RSS** — the same class of bug as the export-side fix,
+just on the read/replay side. `xrla-import` read the whole 41.35 GB chunk file into one `Vec<u8>`
+(`fs::read`), then `deserialize_chunk` parsed it into a second, fully-owned `Chunk` struct
+(another full copy of every node's content), all while `replay_chunk` built a *third* copy in
+`state`/`all_state_nodes`. Fixed the same way as the exporter: a streaming `ChunkReader` (mirrors
+`ChunkWriter`, reuses the same `read_node`/`read_delta`/`read_tx_map` parsing functions through a
+hashing `Read` wrapper) that folds each node straight into `state`/`all_state_nodes` as it's
+parsed, verifying each checkpoint node's own hash inline (`recompute_node_hash`) instead of
+batching a second clone of the whole checkpoint just to call `verify_state_nodes` on it. v2 files
+(not streamable — see `spec/chunk-format.md`) fall back to the original buffered path.
+
+Result: **127.46 GB → 96.2 GB peak**, real chunk, identical `ledger.db` output
+(19,999 rows, `107287901–107307899`). Added
+`streaming_replay_matches_buffered_replay_on_the_same_chunk` (writes a chunk via `ChunkWriter`,
+replays it via both paths, asserts identical results — including that a tampered `LedgerHash` is
+still caught).
+
+**This did not fully fix the OOM** — 96.2 GB is still high for a 20k-ledger chunk. The remaining
+cost was `write_to_nudb` (see Bug 2).
+
+### Cross-checked against real mainnet, not just self-consistency
+
+Once reseeded and caught up (`server_state: full` in ~7 min this run, versus 12m41s cold-starting
+from nothing), queried 1,650 ledgers total (400 + 250 + 1,000, sampled across the reseeded range)
+against **real xrpld reference nodes** (`r.ripple.com`, `xrplcluster.com`) and Clio
+(`s2.ripple.com`) — `ledger_hash`, `account_hash`, `parent_hash`, `transaction_hash`,
+`total_coins`, every close-time field, and per-transaction `Fee`/`Account`/`Destination`/`Amount`/
+`TransactionType`/`Sequence`/`Flags`/`SigningPubKey`/`TransactionResult`/`delivered_amount`/
+affected-node count for ~220,000 transactions: **~2.4M field comparisons, zero canonical data
+mismatches.** The only field that ever differed was `delivered_amount` — a serve-time-derived
+field `xrplcluster.com` omits in this RPC shape that both we and `r.ripple.com`/Clio populate
+identically; the underlying `transaction_hash` (tx-tree root) matched byte-for-byte across every
+endpoint regardless.
+
+Also surfaced two real quirks in the public reference endpoints worth remembering for any future
+comparison: `tooBusy`/`slowDown` arrive as **HTTP 200 with a JSON-level error**, not 429/503 — a
+naive HTTP-status-only backoff will silently misread these as data mismatches. And
+`r.ripple.com` is a load-balanced pool of backends with differing rolling retention floors, so a
+`lgrNotFound` from it can mean "this particular backend doesn't have it," not "it doesn't exist."
+
+### Bug 2: the write side (`write_nudb_store_streaming`, fixed 2026-09-30)
+
+Chasing a chunk-size decision (see PLAN.md's "Chunk size decision" section) surfaced a second,
+separate buffering bug. `write_to_nudb` built `all_state_nodes`/`tx_nodes` (already resident from
+replay) into a *third* copy — a `HashMap<Hash256, Vec<u8>>` re-encoding every node's content into
+NuDB wire format — before handing it to `write_nudb_store`, which then held a *fourth* copy
+(`entries: Vec<(Hash256, Vec<u8>)>`, collected from that map) for the entire `.dat`-writing pass.
+
+Fixed by adding `write_nudb_store_streaming`, which takes an iterator instead of a slice and
+writes each entry straight to the `.dat` file as it's pulled — the caller now passes a lazy
+iterator over `all_state_nodes.values().chain(tx_nodes.iter())` that encodes each node's wire
+value one at a time, never collecting it. Dedup (a hash appearing in both `all_state_nodes` and
+`tx_nodes` keeps whichever is seen first, matching the old `HashMap::entry().or_insert_with()`
+behavior) now happens via a `HashSet<Hash256>` alongside the small `placed: Vec<(u64, Hash256,
+u64, u64)>` metadata list the bucket-sizing pass needs — neither holds node content.
+`write_nudb_store` (the original slice-based function) now just delegates to the streaming
+version, so nothing calling it needed to change.
+
+Result on the same real 20,000-ledger chunk: **96.2 GB → 64.3 GB peak**, identical output
+(19,999 rows, same range, exit 0).
+
+**Still not fully fixed.** `all_state_nodes` and `tx_nodes` themselves are still fully resident
+for the entire run — replay happens completely, *then* writing happens completely. Extrapolating
+64.3 GB linearly to a 150,000-ledger chunk (~7.5x the delta/tx content) gives **~482 GB** — down
+from a ~720 GB projection before this fix, but still far past the 123 GB test box, and not safely
+below most real hardware either. Closing this fully requires interleaving NuDB writes with
+replay (write each ledger's nodes as it's replayed, not after the whole chunk is done) — the same
+architectural shift that made `ChunkWriter`/`ChunkReader` work, just not yet applied to the
+replay↔write boundary itself. Not done. Do not ship a 150,000-ledger (or larger) chunk size
+without either this fix or a real test at that scale on real hardware.
 
 ---
 

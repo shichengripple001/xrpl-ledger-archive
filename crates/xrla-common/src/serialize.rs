@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -228,6 +228,133 @@ impl Drop for ChunkWriter {
         if !self.finished {
             let _ = fs::remove_file(&self.tmp_path);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming chunk reader
+// ---------------------------------------------------------------------------
+
+/// Wraps a `Read` and feeds every byte actually consumed through a running SHA-512, so the
+/// existing `read_node`/`read_delta`/`read_tx_map` helpers (unchanged, still generic over
+/// `impl Read`) can be reused for streaming without duplicating their parsing logic.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha512,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        Ok(n)
+    }
+}
+
+/// Reads a v3 chunk one piece at a time — checkpoint node by node, then (delta, tx_map) pair
+/// by pair — instead of `deserialize_chunk`'s approach of reading the whole file into one
+/// `Vec<u8>` and materializing every node/delta/tx_map into a second, fully-owned `Chunk`
+/// struct before a caller sees any of it. That approach held the raw file bytes, the parsed
+/// `Chunk`, and the replay's own `state`/`all_state_nodes` maps all alive simultaneously —
+/// three-plus copies of the same content — and OOM-killed a real 20,000-ledger mainnet
+/// import at 127 GB RSS (2026-09-29). `ChunkReader` never holds more than the current
+/// node/delta/tx_map being parsed, so peak memory is whatever the caller chooses to keep
+/// (for `xrla-import`, that's just the final `state`/`all_state_nodes`/`tx_nodes`).
+///
+/// v2 only, not v3: use `deserialize_chunk` instead — the v2 block layout (all deltas, then
+/// all tx_maps) can't be streamed for the same reason `ChunkWriter` can't write it streamed;
+/// see `spec/chunk-format.md`.
+pub struct ChunkReader {
+    inner: HashingReader<BufReader<File>>,
+    pub network_id: u32,
+    pub start_ledger: u32,
+    pub end_ledger: u32,
+    pub checkpoint_hash: Hash256,
+    stored_chunk_hash: Hash256,
+    deltas_remaining: u32,
+}
+
+impl ChunkReader {
+    /// Opens the file and reads its header. Errors if the file is v2 — callers should fall
+    /// back to `deserialize_chunk` for those.
+    pub fn open(path: &std::path::Path) -> Result<Self> {
+        let mut header_reader = BufReader::new(File::open(path)?);
+
+        let magic = read_exact(&mut header_reader, 4)?;
+        if magic != MAGIC_HEADER {
+            anyhow::bail!("{}", ChunkError::InvalidMagic);
+        }
+        let version = read_u8(&mut header_reader)?;
+        if version != FORMAT_VERSION_STREAMED {
+            anyhow::bail!(
+                "ChunkReader only streams format v{FORMAT_VERSION_STREAMED} chunks; this file \
+                 is v{version} — use deserialize_chunk instead"
+            );
+        }
+        let network_id = read_u32be(&mut header_reader)?;
+        let start_ledger = read_u32be(&mut header_reader)?;
+        let end_ledger = read_u32be(&mut header_reader)?;
+        let checkpoint_hash = read_hash(&mut header_reader)?;
+        let stored_chunk_hash = read_hash(&mut header_reader)?;
+
+        Ok(Self {
+            inner: HashingReader { inner: header_reader, hasher: Sha512::new() },
+            network_id,
+            start_ledger,
+            end_ledger,
+            checkpoint_hash,
+            stored_chunk_hash,
+            deltas_remaining: end_ledger - start_ledger,
+        })
+    }
+
+    /// Streams the checkpoint, calling `f` once per node instead of collecting a `Vec`.
+    pub fn read_checkpoint(&mut self, mut f: impl FnMut(SHAMapNode)) -> Result<u32> {
+        let count = read_u32be(&mut self.inner)?;
+        for _ in 0..count {
+            f(read_node(&mut self.inner)?);
+        }
+        Ok(count)
+    }
+
+    /// Reads the checkpoint ledger's own TX Map Entry — call once, right after
+    /// `read_checkpoint`.
+    pub fn read_checkpoint_tx_map(&mut self) -> Result<TxMap> {
+        Ok(read_tx_map(&mut self.inner)?)
+    }
+
+    /// Reads the next (delta, tx_map) pair, or `None` once every ledger from
+    /// `start_ledger + 1` to `end_ledger` has been read.
+    pub fn next_delta_tx_map(&mut self) -> Result<Option<(LedgerDelta, TxMap)>> {
+        if self.deltas_remaining == 0 {
+            return Ok(None);
+        }
+        let delta = read_delta(&mut self.inner)?;
+        let tx_map = read_tx_map(&mut self.inner)?;
+        self.deltas_remaining -= 1;
+        Ok(Some((delta, tx_map)))
+    }
+
+    /// Reads the footer and verifies the running chunk_hash matches the header's claim.
+    /// Call only after `next_delta_tx_map` has returned `None`.
+    pub fn finish(mut self) -> Result<()> {
+        let footer = read_exact(&mut self.inner, 4)?;
+        if footer != MAGIC_FOOTER {
+            anyhow::bail!("{}", ChunkError::InvalidMagic);
+        }
+        let digest = self.inner.hasher.finalize();
+        let mut actual = [0u8; 32];
+        actual.copy_from_slice(&digest[..32]);
+        if actual != self.stored_chunk_hash {
+            anyhow::bail!(
+                "{}",
+                ChunkError::HashMismatch {
+                    expected: hex::encode(self.stored_chunk_hash),
+                    got: hex::encode(actual),
+                }
+            );
+        }
+        Ok(())
     }
 }
 

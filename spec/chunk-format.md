@@ -24,7 +24,7 @@ Status: DRAFT
 > RSS dropped from 121.6 GB (OOM-killed under v2's block layout) to 18.3 GB under v3.
 > **v3 does not change how many bytes a chunk takes** — identical content, identical size,
 > only reordered. What it changes is which chunk shapes are *reachable*: a single 20,000-ledger
-> chunk is 38.5 GB versus 51.3 GB for the same ledgers split into two 10k chunks (one
+> chunk is 41.35 GB versus 51.3 GB for the same ledgers split into two 10k chunks (one
 > checkpoint instead of two), and before v3 that single-chunk shape simply OOM-killed. The
 > size saving belongs to using fewer, wider chunks; v3 is what makes that affordable.
 > v2 files (including ones already produced) remain fully readable; `FORMAT_VERSION` (2) and
@@ -321,10 +321,13 @@ Either way, checkpoints SHOULD be sparse (e.g. one per ~1M ledgers), with delta/
 referencing the nearest preceding checkpoint, so checkpoint bytes are not repeated per chunk.
 
 Measured cost of *not* doing this, on a real 20,000-ledger mainnet range (2026-09-29): one
-checkpoint + 20k deltas in a single v3 file = 38.5 GB, versus 51.3 GB for the same ledgers
+checkpoint + 20k deltas in a single v3 file = 41.35 GB, versus 51.3 GB for the same ledgers
 split into two 10k chunks that each carry their own checkpoint. At this density a mainnet
-checkpoint is ~13 GB (28.3M nodes, ~468 B/node), so every extra chunk boundary costs roughly
-that much — which is what makes sparse checkpointing worth the added indirection.
+checkpoint duplication costs ~10 GB per extra chunk boundary at this scale (measured directly
+by subtracting the single-chunk total from the two-chunk total — not a "total bytes / total
+nodes" average, which overestimates this by ~30% since checkpoint and delta content don't
+average the same bytes/node) — which is what makes sparse checkpointing worth the added
+indirection.
 
 ## Local Query Index (informative)
 

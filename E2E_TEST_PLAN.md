@@ -290,8 +290,10 @@ EC2 nodes across two regions). Full detail and the three real bugs found is in `
   earlier experiment, which silently capped serving below itself regardless of what data existed.
 - **Part 3 (chunk size) — not run then; measured 2026-09-29.** On a real 20,000-ledger mainnet
   range: 10k as one chunk = 24.87 GB / 3m55s; the same 20k split as two 10k chunks = 51.33 GB /
-  10m52s; 20k as a single chunk = 38.5 GB / 7m35s. Each extra chunk boundary costs a full
-  duplicated checkpoint (~13 GB at this scale), so wider chunks win on size — but under the old
+  10m52s; 20k as a single chunk = 41.35 GB / 7m35s. Each extra chunk boundary costs a full
+  duplicated checkpoint (~10 GB at this scale, measured by subtracting the single-chunk total
+  from the sum of the two split chunks — not a per-node average, which overestimates this by ~30%),
+  so wider chunks win on size — but under the old
   v2 layout a single 20k chunk OOM-killed the exporter at 121.6 GB RSS, which is what forced the
   streaming writer and format v3 (18.3 GB peak for the same output). See `STATUS.md`.
 - **Part 4 (compression) — still not run.** Remains open, tracked in `PLAN.md`.

@@ -42,6 +42,28 @@ pub fn write_nudb_store(
     dat_path: &Path,
     key_path: &Path,
 ) -> Result<()> {
+    write_nudb_store_streaming(
+        entries.iter().map(|(h, v)| (*h, v.clone())),
+        dat_path,
+        key_path,
+    )
+}
+
+/// Same as `write_nudb_store`, but takes an iterator instead of a pre-built slice, so a
+/// caller can encode each entry's value lazily — one at a time, written straight to the
+/// `.dat` file — instead of first collecting every entry into one big `Vec<(Hash256,
+/// Vec<u8>)>`. `write_nudb_store` itself is unavoidably not this lazy (it's handed an
+/// already-fully-materialized slice), but `xrla-import` calls this directly with a lazy
+/// iterator over its replay result, which is what actually avoids the second full copy of
+/// every node's content that `write_nudb_store`'s old inline implementation used to require.
+///
+/// Only `placed` (small: one `(u64, Hash256, u64, u64)` tuple per entry, not the value
+/// content) needs to be held for the whole call — see the doc comment on `PlacedEntry`.
+pub fn write_nudb_store_streaming(
+    entries: impl IntoIterator<Item = (Hash256, Vec<u8>)>,
+    dat_path: &Path,
+    key_path: &Path,
+) -> Result<()> {
     let salt: u64 = 0x5852_4C41_5852_4C41; // "XRLAXRLA" — arbitrary but fixed
     let uid: u64 = 1;
     let appnum: u64 = 1;
@@ -51,24 +73,35 @@ pub fn write_nudb_store(
         .with_context(|| format!("create {}", dat_path.display()))?;
     write_dat_header(&mut dat, version, uid, appnum)?;
 
-    let mut placed: Vec<PlacedEntry> = Vec::with_capacity(entries.len());
+    let mut placed: Vec<PlacedEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<Hash256> = std::collections::HashSet::new();
     let mut offset = DAT_HEADER_SIZE;
     for (hash, value) in entries {
+        // First-wins dedup, matching the old `HashMap::entry().or_insert_with()` semantics
+        // (a hash appearing in both `all_state_nodes` and `tx_nodes` keeps whichever value
+        // is encountered first) — but without needing every value resident to check it.
+        if !seen.insert(hash) {
+            continue;
+        }
         let val_size = value.len() as u64;
         let mut size_field = [0u8; 6];
         write_u48(&mut size_field, val_size);
         dat.write_all(&size_field)?;
-        dat.write_all(hash)?;
-        dat.write_all(value)?;
+        dat.write_all(&hash)?;
+        dat.write_all(&value)?;
+        // `value` (and its heap allocation) is dropped here, at the end of this iteration
+        // — never held alongside the next entry's value, unlike a pre-built Vec.
 
-        let nhash = xxh64(hash, salt) >> 16;
-        placed.push((nhash, *hash, offset, val_size));
+        let nhash = xxh64(&hash, salt) >> 16;
+        placed.push((nhash, hash, offset, val_size));
         offset += 6 + KEY_SIZE as u64 + val_size;
     }
 
-    // Size the bucket table for a target load factor of ~0.5.
+    // Size the bucket table for a target load factor of ~0.5. Uses `placed.len()`
+    // (post-dedup count), not `entries.len()` — `entries` was consumed by the loop above,
+    // and pre-dedup count would be wrong anyway if any hash collided.
     let target_load = 0.5;
-    let num_buckets = ((entries.len() as f64 / (BUCKET_CAPACITY as f64 * target_load)).ceil() as u64).max(1);
+    let num_buckets = ((placed.len() as f64 / (BUCKET_CAPACITY as f64 * target_load)).ceil() as u64).max(1);
     let mut modulus = 1u64;
     while modulus < num_buckets {
         modulus <<= 1;

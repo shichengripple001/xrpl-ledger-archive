@@ -64,7 +64,7 @@ cryptographically: every transaction ID, account-state root, and chained `Ledger
 independently recomputed and checked against on-chain values.
 
 **Measured at the live mainnet tip** (2026-09-29): 44 ledgers/sec; 20,000 ledgers export to a
-single 38.5 GB chunk in 7m35s at 18.3 GB peak RSS.
+single 41.35 GB chunk in 7m35s at 18.3 GB peak RSS.
 
 **Not proven**: anything at full-history scale. No genesis-to-tip run has ever been done, and
 compression is unmeasured. Note that extrapolating archive size from tip density overestimates

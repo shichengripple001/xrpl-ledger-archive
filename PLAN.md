@@ -99,17 +99,20 @@ transactions per ledger:               ~90 txns (4,500 over 51 ledgers); verifie
 from a year-old snapshot. Supersedes the figures above where they disagree:
 
 ```
-checkpoint (full state @ 107287900):  28,311,240 nodes, ~13 GB   (~468 B/node, uncompressed)
+checkpoint (full state @ 107287900):  28,311,240 nodes, ~10 GB   (measured by subtraction, not
+                                       a bytes/node average — see STATUS.md; that heuristic
+                                       overestimates this by ~30%)
 delta per ledger:                      ~2,620 changed nodes, ~1.4 MB raw
 transactions per ledger:               ~141 txns (2,849,339 over 19,999 ledgers)
-whole chunk (1 checkpoint + 20k):      38.5 GB in 7m35s, 18.3 GB peak RSS (format v3)
+whole chunk (1 checkpoint + 20k):      41.35 GB in 7m35s, 18.3 GB peak RSS (format v3)
 ```
 
 Both the per-node size (333 → 468 B) and the per-ledger delta (1.02 → 1.4 MB) grew against the
 2026-06-30 numbers, consistent with the network's own growth over that interval. **Do not scale
-these to full history** — see STATUS.md: today's rate is ~4.3x the lifetime average, so
+these to full history** — see STATUS.md: today's rate is ~4.3-4.5x the lifetime average, so
 extrapolating the tip density across 107.3M ledgers overestimates by ~6x (206 TB predicted vs.
-32–35 TB actually on disk at a real full-history node).
+~32–35 TB actually on disk — a real, continuously-growing number measured at ~33.5 TB in July
+and ~32-35 TB in September, consistent with ~12 GB/day growth over that interval).
 
 ### The original 35 KB/ledger estimate was wrong by ~33×
 
@@ -131,37 +134,80 @@ sorted by hash). This is the information floor. A full-history node stores that 
 plus the `.key` hash index, `ledger.db` + `transaction.db`, and NuDB pre-allocation slack. We ship
 only the nodes (the `.key` index is rebuilt at import time), compressed.
 
-Measured compression on real chunk data: **~1.9–2.2×** (zstd-3 ≈ 1.95×, lz4 ≈ 1.87×).
+Measured compression on real chunk data: **~1.9–2.2×** (zstd-3 ≈ 1.95×, lz4 ≈ 1.87×) — from
+2026-06-30 PoC-scale data, never re-measured against a real mainnet-density v3 chunk. Treat as
+directional, not exact, until re-verified (see chunk-size decision below).
 
 ```
-Compression:                  ~2×
-Per-ledger delta:             1.02 MB raw → ~0.51 MB compressed  (≈ 12 GB/day ÷ 21,600 ledgers/day)
-Checkpoint (current state):   9.0 GB raw  → ~4.6 GB compressed   (grows with account count)
+Compression (unverified at current scale): ~2×
+Per-ledger delta (today's tip):    1.4 MB raw → ~0.7 MB compressed (est.)
+Checkpoint (current state):        ~10 GB raw → ~5 GB compressed (est.), grows with account count
 
-Full archive (~105M ledgers), deduped + compressed:
-  all unique state nodes:     ≈ the full node's .dat portion  (the floor; est. ~25–30 TB)
-  sparse checkpoints:         ~0.3 TB  (one per 1M ledgers)  — negligible
-  → vs 39 TB for a running full node (we shed .key index + SQLite + slack)
+Full archive (~107.3M ledgers), deduped + compressed:
+  all unique state nodes:     ≈ the full node's nudb (the floor; measured ~32–35 TB, uncompressed)
+  checkpoint overhead:        depends entirely on chunk size — see decision below
+  → vs ~32–35 TB for a running full node's nudb alone (we shed the 11 TB transaction.db index
+    and most of the 296 GB ledger.db's accumulated SQLite bloat — see STATUS.md)
 ```
 
 **Why this is *not* the failed-sharding blowup.** 2018 history sharding re-stored the unchanged
 upper-trie inner nodes in every shard, so aggregate storage exceeded a single full node. Here each
 unique node appears exactly once across the whole archive, so the aggregate is bounded *below* a
-full node. The only thing that repeats is the checkpoint, and that is a tunable knob, not inner-node
-duplication.
+full node **only if checkpoint duplication is kept small** — the only thing that repeats is the
+checkpoint, and that is a tunable knob (chunk size), not inner-node duplication. Get the chunk
+size wrong (too small) and you reproduce the same blowup by a different mechanism — see below,
+where 20,000-ledger chunks alone would cost ~54 TB of *duplicated checkpoints on top of* the
+32-35 TB floor, i.e. an archive bigger than the node it replaces.
 
-**Two distinct wins:**
-1. *vs old sharding* — dedup makes it actually work (aggregate ≤ full node, not >).
-2. *vs all-or-nothing* — a full node is 39 TB to participate at all; with chunks an operator
-   downloads only the ledger ranges it needs, in parallel, in hours.
+### Chunk size decision: 150,000 ledgers (2026-09-29)
 
-**Checkpoint spacing is a design parameter, not a blocker.** Per-chunk full checkpoints would add
-~2.6 TB of duplication; one checkpoint per ~1M ledgers (a chunk referencing the nearest preceding
-one) drops that to ~0.3 TB while keeping reconstruction bounded. Decide spacing in Phase 1.
+Every `.xrla` chunk (as built today) carries its own full checkpoint, so total archive size is
+`floor (32–35 TB, fixed) + chunk_count × checkpoint_size`. Checkpoint size, measured by exact
+subtraction of real chunk totals (not a bytes/node average, which overestimates by ~30% — see
+STATUS.md), is **~10 GB** at today's account-state size. That makes chunk count, and therefore
+chunk size, the only real lever:
 
-**To validate at scale (Phase 2):** sample checkpoint sizes at older sequences (state was much
-smaller historically), sum real deltas over a multi-million-ledger range, and confirm the floor
-against a full node's actual `.dat` size.
+| Chunk size | Days of mainnet activity (~21,600 ledgers/day) | # chunks | Checkpoint overhead | Total archive (uncompressed) | Total archive (compressed, est.) |
+|---|---|---|---|---|---|
+| 20,000 *(the only size actually tested)* | ~0.9 | ~5,364 | ~54 TB | ~86–89 TB | ~39–47 TB |
+| 100,000 | ~4.6 | ~1,073 | ~11 TB | ~43–46 TB | ~19–24 TB |
+| **150,000 *(chosen)*** | **~6.9** | **~715** | **~7.15 TB** | **~39–42 TB** | **~18–22 TB** |
+| 250,000 | ~11.6 | ~429 | ~4.3 TB | ~36–39 TB | ~17–21 TB |
+| 500,000 | ~23 | ~215 | ~2.1 TB | ~34–37 TB | ~16–20 TB |
+| 1,000,000 | ~46 | ~107 | ~1.1 TB | ~33–36 TB | ~15–19 TB |
+
+Per-chunk size at 150,000 ledgers, today's tip density: ~10 GB checkpoint + 150,000 × 1.4 MB
+delta ≈ **~220 GB uncompressed, ~100–116 GB compressed (est.)**. Download time at that size:
+~1.5–2 min on a 10 Gbps datacenter link, ~15–19 min on a 1 Gbps connection.
+
+**Why 150,000 over the size-optimal 250,000–1,000,000 range:** the curve flattens hard past
+~250,000 (going from 250k to 1M only saves another ~2–5 TB), so the marginal size benefit of
+going bigger is small, while the risk is not — see the open blocker below. 150,000 was chosen as
+a middle ground: meaningfully better than 20k on size, without jumping 25–50x past the only scale
+we've actually tested.
+
+**Two caveats on the compressed column, not yet resolved:**
+1. The 1.9–2.2× ratio is unverified at today's density/format v3 — a real measurement (compress
+   an actual 41.35 GB v3 chunk, compare) is a one-command test that hasn't been run.
+2. Checkpoint content (32-byte hashes, high-entropy) likely compresses worse than transaction/delta
+   content. This matters most at small chunk sizes where checkpoint is a large fraction of the
+   total (>55% at 20k) and matters least at 150k+ (checkpoint is only ~4.5% of a single chunk),
+   so it's a secondary effect at the chosen size, not a reason to reconsider it.
+
+**Open blocker before 150,000 ledgers is safe to ship — not yet fixed:** `xrla-import`'s
+`write_to_nudb` step (the final combined-map write, after replay) was never streamed — only the
+*read/replay* side was fixed (see STATUS.md's streaming `ChunkReader`/`ChunkWriter` section). At
+the only scale actually tested (20,000 ledgers), that step alone peaked at **96 GB RSS** even
+after the read-side fix. 150,000 ledgers is ~7.5x more delta/transaction content than that test;
+extrapolating linearly, `write_to_nudb`'s peak could plausibly exceed **~700 GB** — nowhere close
+to fitting the 123 GB test box, and not confidently safe on larger hardware either without a real
+test. Required before shipping 150k: stream `write_to_nudb` the same way `ChunkWriter`/
+`ChunkReader` were streamed, then run a real 150,000-ledger export + import on real mainnet data
+end to end — not an extrapolation.
+
+**To validate at scale (Phase 2), beyond the blocker above:** sample checkpoint sizes at older
+sequences (state was much smaller historically, so the ~10 GB figure is a today-only ceiling, not
+a lifetime average), and re-measure the compression ratio on real v3-format, mainnet-density data.
 
 ### Full-history server evidence (2026-07-08)
 
