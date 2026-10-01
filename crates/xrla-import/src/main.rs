@@ -30,6 +30,7 @@ use xrla_common::serialize::{calculate_ledger_hash, deserialize_chunk, ChunkRead
 use xrla_common::shamap::{Hash256, InnerNode, NodeType, SHAMapNode};
 use xrla_common::state_tree::verify_state_nodes;
 use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
+use xrla_nudb::writer::NuDbSink;
 
 #[derive(Parser, Debug)]
 #[command(name = "xrla-import", about = "Import an XRLA chunk file into xrpld NuDB")]
@@ -60,21 +61,25 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>> = HashMap::new();
-    let mut tx_nodes: Vec<SHAMapNode> = Vec::new();
+    let key_path = args.dat.with_extension("key");
+    println!("Writing NuDB store: {} / {}", args.dat.display(), key_path.display());
+
+    // One sink for the whole invocation: every node any chunk produces is written to the
+    // .dat file the moment replay produces it, then dropped. Sharing a single sink across
+    // all --chunk files also gives cross-chunk dedup for free (a node duplicated in a later
+    // chunk's checkpoint is written once), which is what the old
+    // `all_state_nodes.entry().or_insert()` union used to do — without holding that union.
+    let mut sink = NuDbSink::create(&args.dat)?;
     let mut ledger_rows: Vec<LedgerDbRow> = Vec::new();
 
     for chunk_path in &args.chunk {
         println!("Reading chunk: {}", chunk_path.display());
 
-        // v3 files are streamed straight from disk (see replay_chunk_streaming): peak memory
-        // is whatever the caller keeps (state/all_state_nodes/tx_nodes here), not a second
-        // full copy of the file. v2 files can't be streamed (see spec/chunk-format.md) and
-        // fall back to the original read-whole-file-then-parse path. A single 20,000-ledger
-        // real-mainnet v3 chunk OOM-killed the old buffered path at 127 GB RSS (2026-09-29);
-        // this is the fix, mirroring xrla-export's ChunkWriter on the read side.
+        // v3 files are streamed straight from disk (see replay_chunk_streaming). v2 files
+        // can't be streamed (see spec/chunk-format.md) and fall back to the original
+        // read-whole-file-then-parse path.
         let replay = if detect_version(chunk_path)? == FORMAT_VERSION_STREAMED {
-            replay_chunk_streaming(chunk_path, !args.skip_verify)?
+            replay_chunk_streaming(chunk_path, !args.skip_verify, &mut sink)?
         } else {
             let data = fs::read(chunk_path)?;
             println!("Deserializing and verifying chunk (v2, buffered)...");
@@ -84,40 +89,24 @@ fn main() -> Result<()> {
                 chunk.network_id, chunk.start_ledger, chunk.end_ledger, chunk.ledger_count()
             );
             println!("Chunk hash OK: {}", hex::encode(chunk.chunk_hash));
-            replay_chunk(&chunk, !args.skip_verify)?
+            replay_chunk(&chunk, !args.skip_verify, &mut sink)?
         };
 
         println!(
-            "Replayed {} live state nodes, {} tx-tree nodes",
+            "Replayed {} live state nodes; {} unique nodes written so far",
             replay.state.len(),
-            replay.tx_nodes.len(),
+            sink.node_count(),
         );
-
-        // Union across chunks: a node shared across chunk boundaries (e.g. every
-        // later chunk's checkpoint duplicates unchanged nodes from earlier chunks)
-        // is kept once, not once per chunk.
-        for (hash, node) in replay.all_state_nodes {
-            all_state_nodes.entry(hash).or_insert(node);
-        }
-        tx_nodes.extend(replay.tx_nodes);
         ledger_rows.extend(replay.ledger_rows);
     }
 
-    let combined = ReplayResult {
-        state: HashMap::new(),
-        all_state_nodes,
-        tx_nodes,
-        ledger_rows,
-    };
-
-    let key_path = args.dat.with_extension("key");
-    println!("Writing NuDB store: {} / {}", args.dat.display(), key_path.display());
-    write_to_nudb(&combined, &args.dat, &key_path)?;
+    println!("  {} unique nodes total", sink.node_count());
+    sink.finish(&key_path)?;
 
     if let Some(ledger_db_path) = &args.ledger_db {
         println!("Writing ledger.db: {}", ledger_db_path.display());
-        write_ledger_db(&combined.ledger_rows, ledger_db_path)?;
-        println!("  {} rows written", combined.ledger_rows.len());
+        write_ledger_db(&ledger_rows, ledger_db_path)?;
+        println!("  {} rows written", ledger_rows.len());
     }
 
     println!("Import complete.");
@@ -143,38 +132,51 @@ struct LedgerDbRow {
 #[derive(Debug)]
 struct ReplayResult {
     /// Final live account-state SHAMap nodes (checkpoint replayed through all deltas) —
-    /// used for root-tracking/verification during replay, not for the NuDB write-set (a
-    /// real full-history node retains every node any served ledger ever referenced, not
-    /// just the range's last live set; see `all_state_nodes`). Shares node storage with
-    /// `all_state_nodes` via `Rc` — a node present in both maps is one allocation, not two;
-    /// a naive `.clone()` of a 27M-node checkpoint doubled resident memory and OOM'd a real
-    /// run (2026-09-28), which is why this isn't a plain `HashMap<Hash256, SHAMapNode>`.
+    /// used for the checkpoint root-presence check and as the live-set invariant (a
+    /// superseded node must not survive here). **Bounded**: each delta inserts its added
+    /// nodes and removes its deleted ones, so this tracks the account state's current size
+    /// (~28M nodes on mainnet today) and does *not* grow with the chunk's ledger range.
+    ///
+    /// Every node the chunk contains — checkpoint plus every delta's `diff.added`, whether
+    /// or not a later delta superseded it, plus every ledger's rebuilt tx-tree nodes — is
+    /// written straight to the `NuDbSink` as replay produces it and then dropped. A real
+    /// full-history node retains every node any served ledger ever referenced, so all of
+    /// them must reach the store, but none of them need to be *retained in memory* to get
+    /// there. Accumulating them (as `all_state_nodes` / `tx_nodes` fields used to) is what
+    /// made import memory scale with range length: 64 GB for 20,000 real mainnet ledgers,
+    /// extrapolating past 480 GB at 150,000. See STATUS.md.
     state: HashMap<Hash256, Rc<SHAMapNode>>,
-    /// Every state node the chunk contains: the checkpoint plus every delta's
-    /// `diff.added`, regardless of whether a later delta's `diff.deleted` superseded it.
-    /// This — not `state` — is what gets written to the NuDB store, so every ledger in
-    /// the chunk's range stays servable, not just the last one.
-    all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>>,
-    /// Every inner/leaf node of every ledger's rebuilt transaction tree.
-    tx_nodes: Vec<SHAMapNode>,
     /// One row per ledger from the first delta onward (see `Args::ledger_db` doc comment
-    /// for why the checkpoint ledger itself is excluded).
+    /// for why the checkpoint ledger itself is excluded). Small: ~130 bytes/ledger.
     ledger_rows: Vec<LedgerDbRow>,
+}
+
+/// Encode a node into its NuDB on-disk value and hand it to the sink, which writes it to
+/// the `.dat` file immediately. The encoded `Vec<u8>` lives only for this call.
+fn sink_node(sink: &mut NuDbSink, node: &SHAMapNode) -> Result<()> {
+    // Check before encoding: on a multi-chunk import every later chunk's checkpoint repeats
+    // ~28M nodes the previous chunk already wrote, and encoding just to discard is wasted work.
+    if sink.contains(&node.hash) {
+        return Ok(());
+    }
+    let value = xrla_nudb::dat::encode_wire_to_value(&node.content, &node.node_type);
+    sink.write_node(node.hash, &value)
 }
 
 /// Replay checkpoint + deltas, rebuilding each ledger's transaction tree along the way.
 /// When `verify` is true, independently recomputes and asserts (bailing on the first
 /// mismatch): per-transaction authenticity, the account-state root, and the full
 /// LedgerHash chained to the previous ledger.
-fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
+fn replay_chunk(chunk: &Chunk, verify: bool, sink: &mut NuDbSink) -> Result<ReplayResult> {
     let mut state: HashMap<Hash256, Rc<SHAMapNode>> = chunk
         .checkpoint
         .iter()
         .map(|n| (n.hash, Rc::new(n.clone())))
         .collect();
-    // Shares the same Rc<SHAMapNode> as `state`, not a second copy of the node bytes.
-    let mut all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>> = state.clone();
-    let mut tx_nodes = Vec::new();
+    // Checkpoint nodes go to the store immediately; only the live `state` map is retained.
+    for node in &chunk.checkpoint {
+        sink_node(sink, node)?;
+    }
 
     if chunk.tx_maps.is_empty() {
         bail!("chunk has no TX_MAPS entries");
@@ -200,7 +202,10 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
         }
     }
     let (_, nodes) = build_tx_tree(&cp.txns);
-    tx_nodes.extend(nodes);
+    for node in &nodes {
+        sink_node(sink, node)?;
+    }
+    drop(nodes);
     if verify {
         println!(
             "  ledger {} (checkpoint): account_hash OK, {} txns authentic, {} state nodes \
@@ -217,9 +222,8 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
 
     for (i, delta) in chunk.deltas.iter().enumerate() {
         for node in &delta.diff.added {
-            let shared = Rc::new(node.clone());
-            state.insert(node.hash, Rc::clone(&shared));
-            all_state_nodes.insert(node.hash, shared);
+            state.insert(node.hash, Rc::new(node.clone()));
+            sink_node(sink, node)?;
         }
         for hash in &delta.diff.deleted {
             state.remove(hash);
@@ -238,7 +242,10 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
 
         let new_root = find_new_root(&delta.diff.added, &current_root)?;
         let (tx_hash, nodes) = build_tx_tree(&tx_map.txns);
-        tx_nodes.extend(nodes);
+        for node in &nodes {
+            sink_node(sink, node)?;
+        }
+        drop(nodes);
 
         if verify {
             verify_txns_authentic(tx_map)?;
@@ -306,7 +313,7 @@ fn replay_chunk(chunk: &Chunk, verify: bool) -> Result<ReplayResult> {
         prev_ledger_hash = tx_map.ledger_hash;
     }
 
-    Ok(ReplayResult { state, all_state_nodes, tx_nodes, ledger_rows })
+    Ok(ReplayResult { state, ledger_rows })
 }
 
 /// Peeks a chunk file's format-version byte (5 bytes read, not the whole file) so `main`
@@ -325,7 +332,11 @@ fn detect_version(path: &std::path::Path) -> Result<u8> {
 /// (`state_tree::recompute_node_hash`), not batched afterward — batching would mean
 /// cloning the entire checkpoint a second time just to hand it to `verify_state_nodes`,
 /// defeating the point of streaming.
-fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<ReplayResult> {
+fn replay_chunk_streaming(
+    path: &std::path::Path,
+    verify: bool,
+    sink: &mut NuDbSink,
+) -> Result<ReplayResult> {
     let mut reader = ChunkReader::open(path)?;
     println!(
         "Chunk: network={} ledgers={}..{} ({} ledgers, streamed)",
@@ -337,14 +348,24 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
 
     let mut state: HashMap<Hash256, Rc<SHAMapNode>> = HashMap::new();
     let mut bad_checkpoint_hash: Option<Hash256> = None;
+    let mut sink_err: Option<anyhow::Error> = None;
     reader.read_checkpoint(|node| {
         if verify && bad_checkpoint_hash.is_none() {
             if xrla_common::state_tree::recompute_node_hash(&node) != node.hash {
                 bad_checkpoint_hash = Some(node.hash);
             }
         }
+        // Straight to the .dat file as it is parsed; only the live map is retained.
+        if sink_err.is_none() {
+            if let Err(e) = sink_node(sink, &node) {
+                sink_err = Some(e);
+            }
+        }
         state.insert(node.hash, Rc::new(node));
     })?;
+    if let Some(e) = sink_err {
+        return Err(e);
+    }
     if let Some(bad_hash) = bad_checkpoint_hash {
         bail!(
             "checkpoint: node {} does not hash to its own claimed content \
@@ -352,9 +373,6 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
             hex::encode(bad_hash)
         );
     }
-    // Shares the same Rc<SHAMapNode> as `state`, not a second copy of the node bytes.
-    let mut all_state_nodes: HashMap<Hash256, Rc<SHAMapNode>> = state.clone();
-    let mut tx_nodes = Vec::new();
 
     let cp = reader.read_checkpoint_tx_map()?;
     if !state.contains_key(&cp.account_hash) {
@@ -367,7 +385,10 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
         verify_txns_authentic(&cp)?;
     }
     let (_, nodes) = build_tx_tree(&cp.txns);
-    tx_nodes.extend(nodes);
+    for node in &nodes {
+        sink_node(sink, node)?;
+    }
+    drop(nodes);
     if verify {
         println!(
             "  ledger {} (checkpoint): account_hash OK, {} txns authentic, {} state nodes \
@@ -384,9 +405,8 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
 
     while let Some((delta, tx_map)) = reader.next_delta_tx_map()? {
         for node in &delta.diff.added {
-            let shared = Rc::new(node.clone());
-            state.insert(node.hash, Rc::clone(&shared));
-            all_state_nodes.insert(node.hash, shared);
+            state.insert(node.hash, Rc::new(node.clone()));
+            sink_node(sink, node)?;
         }
         for hash in &delta.diff.deleted {
             state.remove(hash);
@@ -401,7 +421,10 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
 
         let new_root = find_new_root(&delta.diff.added, &current_root)?;
         let (tx_hash, nodes) = build_tx_tree(&tx_map.txns);
-        tx_nodes.extend(nodes);
+        for node in &nodes {
+            sink_node(sink, node)?;
+        }
+        drop(nodes);
 
         if verify {
             verify_txns_authentic(&tx_map)?;
@@ -470,7 +493,7 @@ fn replay_chunk_streaming(path: &std::path::Path, verify: bool) -> Result<Replay
     }
 
     reader.finish()?;
-    Ok(ReplayResult { state, all_state_nodes, tx_nodes, ledger_rows })
+    Ok(ReplayResult { state, ledger_rows })
 }
 
 fn verify_txns_authentic(tx_map: &TxMap) -> Result<()> {
@@ -573,43 +596,21 @@ fn write_ledger_db(rows: &[LedgerDbRow], path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn write_to_nudb(replay: &ReplayResult, dat_path: &std::path::Path, key_path: &std::path::Path) -> Result<()> {
-    // Write every state node the chunk ever contained (checkpoint ∪ all diff.added), not
-    // just replay.state's post-replay live set — otherwise only the chunk's last ledger
-    // would be servable. See ReplayResult::all_state_nodes.
-    //
-    // Streamed via `write_nudb_store_streaming`: each node's wire-format value is encoded
-    // lazily, one at a time, as this iterator is pulled — never collected into an
-    // intermediate `HashMap<Hash256, Vec<u8>>` holding every re-encoded value at once. That
-    // intermediate map used to exist alongside `all_state_nodes`/`tx_nodes` (already
-    // resident) as a second full copy of the same content, and was the reason a real
-    // 20,000-ledger mainnet import peaked at 96 GB RSS even after the read-side
-    // (`ChunkReader`) streaming fix — see STATUS.md.
-    println!(
-        "  writing NuDB store from {} state + {} tx-tree nodes (before dedup)",
-        replay.all_state_nodes.len(),
-        replay.tx_nodes.len()
-    );
-    let entries = replay
-        .all_state_nodes
-        .values()
-        .map(|n| (n.hash, xrla_nudb::dat::encode_wire_to_value(&n.content, &n.node_type)))
-        .chain(
-            replay
-                .tx_nodes
-                .iter()
-                .map(|n| (n.hash, xrla_nudb::dat::encode_wire_to_value(&n.content, &n.node_type))),
-        );
-    xrla_nudb::writer::write_nudb_store_streaming(entries, dat_path, key_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use xrla_common::chunk::{LedgerDelta, TxRecord};
     use xrla_common::serialize::sha512half;
     use xrla_common::shamap::SHAMapDiff;
+
+    /// A sink writing into a throwaway temp dir, for tests that care about replay results
+    /// rather than the store bytes. Returns the sink plus its dir so the caller can drop it.
+    fn temp_sink(tag: &str) -> (NuDbSink, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("xrla_sink_{tag}_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let sink = NuDbSink::create(&dir.join("nudb.dat")).unwrap();
+        (sink, dir)
+    }
 
     /// A leaf node with its own hash correctly derived from content (`SHA512half(content)`,
     /// no prefix — see `state_tree` module docs), so it survives `verify_state_nodes`.
@@ -714,7 +715,8 @@ mod tests {
             tx_maps: vec![tx_map_a, tx_map_b],
         };
 
-        let replay = replay_chunk(&chunk, true).expect("replay + verify should succeed");
+        let (mut sink, sink_dir) = temp_sink("two_ledger");
+        let replay = replay_chunk(&chunk, true, &mut sink).expect("replay + verify should succeed");
         assert_eq!(replay.state.len(), 2, "final live state should be exactly ledger B's nodes");
         assert!(replay.state.contains_key(&leaf_b.hash));
         assert!(replay.state.contains_key(&root_b.hash));
@@ -723,11 +725,14 @@ mod tests {
         // A tampered stored LedgerHash must be caught, not silently accepted.
         let mut bad_chunk = chunk;
         bad_chunk.tx_maps[1].ledger_hash[0] ^= 0xFF;
-        let err = replay_chunk(&bad_chunk, true).unwrap_err();
+        let (mut bad_sink, bad_sink_dir) = temp_sink("two_ledger_bad");
+        let err = replay_chunk(&bad_chunk, true, &mut bad_sink).unwrap_err();
         assert!(
             err.to_string().contains("LedgerHash"),
             "expected a LedgerHash mismatch error, got: {err}"
         );
+        fs::remove_dir_all(&sink_dir).ok();
+        fs::remove_dir_all(&bad_sink_dir).ok();
     }
 
     /// The same two-ledger chunk as above, but written to a real v3 file via `ChunkWriter`
@@ -809,7 +814,10 @@ mod tests {
             }],
             tx_maps: vec![tx_map_a.clone(), tx_map_b.clone()],
         };
-        let buffered = replay_chunk(&chunk, true).expect("buffered replay should succeed");
+        let (mut buf_sink, buf_dir) = temp_sink("cmp_buffered");
+        let buffered =
+            replay_chunk(&chunk, true, &mut buf_sink).expect("buffered replay should succeed");
+        let buffered_nodes = buf_sink.node_count();
 
         let dir = std::env::temp_dir()
             .join(format!("xrla_import_streaming_test_{}", std::process::id()));
@@ -834,14 +842,17 @@ mod tests {
         writer.write_tx_map(&tx_map_b).unwrap();
         writer.finish().unwrap();
 
-        let streamed = replay_chunk_streaming(&path, true).expect("streaming replay should succeed");
+        let (mut str_sink, str_dir) = temp_sink("cmp_streamed");
+        let streamed = replay_chunk_streaming(&path, true, &mut str_sink)
+            .expect("streaming replay should succeed");
+        let streamed_nodes = str_sink.node_count();
 
         assert_eq!(streamed.state.len(), buffered.state.len());
         assert!(streamed.state.contains_key(&leaf_b.hash));
         assert!(streamed.state.contains_key(&root_b.hash));
         assert!(!streamed.state.contains_key(&leaf_a.hash));
-        assert_eq!(streamed.all_state_nodes.len(), buffered.all_state_nodes.len());
-        assert_eq!(streamed.tx_nodes.len(), buffered.tx_nodes.len());
+        // Both paths must write the identical set of nodes to the store.
+        assert_eq!(streamed_nodes, buffered_nodes, "both paths must write the same node count");
         assert_eq!(streamed.ledger_rows.len(), buffered.ledger_rows.len());
         assert_eq!(streamed.ledger_rows[0].ledger_seq, buffered.ledger_rows[0].ledger_seq);
         assert_eq!(streamed.ledger_rows[0].account_hash, buffered.ledger_rows[0].account_hash);
@@ -868,13 +879,17 @@ mod tests {
             .unwrap();
         bad_writer.write_tx_map(&bad_tx_map_b).unwrap();
         bad_writer.finish().unwrap();
-        let err = replay_chunk_streaming(&bad_path, true).unwrap_err();
+        let (mut bad2_sink, bad2_dir) = temp_sink("cmp_bad");
+        let err = replay_chunk_streaming(&bad_path, true, &mut bad2_sink).unwrap_err();
         assert!(
             err.to_string().contains("LedgerHash"),
             "expected a LedgerHash mismatch error, got: {err}"
         );
 
         fs::remove_dir_all(&dir).ok();
+        for d in [&buf_dir, &str_dir, &bad2_dir] {
+            fs::remove_dir_all(d).ok();
+        }
     }
 
     /// `tag` distinguishes the two synthetic ranges; `seq` must also be folded into the

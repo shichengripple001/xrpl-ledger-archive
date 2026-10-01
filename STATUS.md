@@ -297,6 +297,38 @@ naive HTTP-status-only backoff will silently misread these as data mismatches. A
 `r.ripple.com` is a load-balanced pool of backends with differing rolling retention floors, so a
 `lgrNotFound` from it can mean "this particular backend doesn't have it," not "it doesn't exist."
 
+**Methodology, reusable:** `tools/compare_ledgers.py` (run on the xrpld host itself, so our side
+has no rate limit). For a random sample of ledger sequences, calls the `ledger` RPC
+(`transactions: true, expand: true`) against `127.0.0.1:51234` (ours) and against a rotating pair
+of public endpoints, then diffs every header field and every transaction's canonical fields
+listed above. Handles both quirks above directly: backoff keys off the JSON `error` field (not
+HTTP status), and `lgrNotFound` triggers an endpoint rotation instead of being counted as a
+mismatch. `delivered_amount` differences are bucketed separately as "derived-field diffs," not
+real mismatches, since it's serve-time-derived rather than canonical ledger data. Prints a final
+summary (ledgers matched/mismatched/skipped, field/tx counts, rate-limit stats) plus the first 20
+real mismatches, if any. Usage: `compare_ledgers.py <start> <end> <sample_count> [delay_seconds]`.
+
+### Second, larger cross-check: 10,000 ledgers after the 150k reseed (2026-10-01)
+
+After the real 150,000-ledger export/import measurement (see Bug 3 below) and restarting
+`xrpld`, ran 20 batches of 500 ledgers each (`tools/compare_ledgers.py`), spread across 20
+roughly-equal sub-ranges spanning the full `107145192-107351007` history, against
+`s2.ripple.com`/`r.ripple.com`:
+
+**10,000/10,000 ledgers matched, 0 mismatches, 0 skipped.** 1,237,494 transactions compared,
+**13,722,434 field comparisons, zero real mismatches**, 0 `delivered_amount` diffs, 0 batches
+with any FAIL line. This independently confirms the reseeded node serves byte-for-byte correct
+canonical data across its entire history, including the 150k-ledger range imported with the
+fixed `NuDbSink`.
+
+Also confirmed: after `xrpld` was stopped (for the export, to avoid racing NuDB's in-place
+bucket-table mutation) and restarted, `server_info`'s `complete_ledgers` temporarily reported a
+tiny recent-only range (e.g. `107350685-107350894`) even though the real data was intact the
+whole time (`ledger.db`'s `Ledgers` table still had all 204,024 rows,
+`107145192-107350899`) — it re-expanded back to the full range on its own within a few minutes.
+Worth remembering so a post-restart "empty"/truncated-looking `complete_ledgers` isn't mistaken
+for data loss.
+
 ### Bug 2: the write side (`write_nudb_store_streaming`, fixed 2026-09-30)
 
 Chasing a chunk-size decision (see PLAN.md's "Chunk size decision" section) surfaced a second,
@@ -318,15 +350,77 @@ version, so nothing calling it needed to change.
 Result on the same real 20,000-ledger chunk: **96.2 GB → 64.3 GB peak**, identical output
 (19,999 rows, same range, exit 0).
 
-**Still not fully fixed.** `all_state_nodes` and `tx_nodes` themselves are still fully resident
-for the entire run — replay happens completely, *then* writing happens completely. Extrapolating
-64.3 GB linearly to a 150,000-ledger chunk (~7.5x the delta/tx content) gives **~482 GB** — down
-from a ~720 GB projection before this fix, but still far past the 123 GB test box, and not safely
-below most real hardware either. Closing this fully requires interleaving NuDB writes with
-replay (write each ledger's nodes as it's replayed, not after the whole chunk is done) — the same
-architectural shift that made `ChunkWriter`/`ChunkReader` work, just not yet applied to the
-replay↔write boundary itself. Not done. Do not ship a 150,000-ledger (or larger) chunk size
-without either this fix or a real test at that scale on real hardware.
+**Still not fully fixed at the time this was written.** `all_state_nodes` and `tx_nodes`
+themselves were still fully resident for the entire run — replay happened completely, *then*
+writing happened completely. Extrapolating 64.3 GB linearly to a 150,000-ledger chunk (~7.5x the
+delta/tx content) gave **~482 GB** — down from a ~720 GB projection before this fix, but still
+far past the 123 GB test box.
+
+### Bug 3 (architectural): interleaving replay and writing (2026-09-30, measured 2026-10-01)
+
+Closing the remaining gap needed the same shift `ChunkWriter`/`ChunkReader` made for
+export/read — write each node the moment it's produced, never accumulate it. Implemented: a new
+`NuDbSink` in `xrla-nudb` accepts nodes one at a time (`write_node(hash, value)`) and writes each
+straight to the `.dat` file. `replay_chunk`/`replay_chunk_streaming` now call it directly for
+every checkpoint node, every delta's added nodes, and every ledger's rebuilt tx-tree nodes —
+`ReplayResult` no longer has `all_state_nodes`/`tx_nodes` fields at all. The only thing genuinely
+resident for the whole run is `state` (the *live-only* map, bounded by current account-state
+size — same property that keeps export cheap, since superseded nodes are removed from it as
+replay progresses) plus the sink's own dedup `HashSet<Hash256>` and a small per-node placement
+record.
+
+**Two more real bugs found reviewing this change, both fixed, neither about memory:**
+
+- **Destructive overwrite, again.** `NuDbSink::create` originally truncated the target `.dat`
+  immediately — before a single chunk had even been read. A failed import (bad path, corrupt
+  chunk, anything) destroyed an existing store. Confirmed with a live test: a 45-byte file became
+  a 92-byte empty header after a deliberately-failed import. This is the exact same class of bug
+  the `ledger.db` writer had (see the 2026-09-28 section above) — a second instance, not a repeat
+  of the same one. Fixed: the sink writes to `<path>.tmp` throughout and only renames over the
+  real path in `finish()`, after everything has succeeded. Dropping an unfinished sink deletes the
+  temp file. Two renames (`.dat` then `.key`) can't be jointly atomic, so the old `.key` is moved
+  aside to `.key.bak` first — a crash mid-swap leaves *no* `.key` (xrpld refuses to open that
+  loudly) rather than a new `.dat` silently paired with a stale `.key`. Regression-tested
+  (`aborted_sink_leaves_existing_store_untouched`, `finished_sink_replaces_existing_store_and_is_readable`).
+- **Efficiency, found in the same review pass:** three unbuffered `write(2)` calls per node (now
+  a 4 MiB `BufWriter`; on the 20k run, kernel time already exceeded user time — 502s vs 469s);
+  a full 32-byte hash kept per placement record that the bucket-table format never reads (now
+  dropped, 56 → 24 bytes/entry, ~13 GB saved at 150k scale); duplicate nodes were encoded and
+  then discarded (now checked *before* encoding, which matters most on multi-chunk imports where
+  every later chunk's checkpoint repeats ~28M already-written nodes).
+
+**Measured 2026-10-01, real mainnet, full 150,000-ledger chunk — not an extrapolation.**
+`xrpld` was stopped on `xrpld-poc-fh-usw2-01` to get a consistent read (NuDB's `.key` file isn't
+append-only — linear-hashing splits rewrite bucket entries in place, including ones for
+already-written keys, so concurrent writes from a live node can race a reader even on historical
+ranges). Ran a real export of ledgers 107147192–107297191 (149,999 ledgers, one chunk,
+`--chunk-size 150000`) against the live NuDB store, then imported that chunk into a fresh store
+with this fix in place:
+
+- **Export:** 47:17 wall clock, peak RSS 19.2 GB (the known, accepted `state` map cost — unrelated
+  to this fix), output chunk 207.8 GB, `chunk_hash b18c25586bdea6b75f3794b15f1a416f6ccaff3defab2cf9740d14499d04f50c`.
+- **Import:** 39:39 wall clock, **peak RSS 46.1 GB**, 345,242,107 unique nodes written, 149,999
+  `ledger.db` rows, exit status 0. Every ledger's `account_hash`, txn authenticity, and
+  `LedgerHash` (chained to parent) verified clean end to end.
+
+46 GB confirms the expected effect: peak memory scales with total unique node count, not chunk
+length. The spill-to-disk/external-sort fallback is **not needed** at 150k — 46 GB is well within
+normal headroom, nowhere near the ~482 GB the pre-fix architecture would have extrapolated to.
+Not built, no longer a near-term action item.
+
+### Correction: the "~12 ledgers/min" backfill rate above was misleading
+
+That figure (in "Cold-start peer sync from real mainnet") was total ledgers backfilled divided by
+total wall-clock time, including long stalls — not a real rate. Investigated directly on
+2026-09-30 by inspecting the `peers` RPC: of 16 connected peers, only **3 hold history deeper
+than ~20,000 ledgers**; the other 13 hold exactly the newest ~20,000 and nothing older, and all 3
+deep peers connected to us (inbound), so we don't control routing to them. Measured rate while
+those 3 were actually being used: **~132 ledgers/min** over a 2-minute window — much faster than
+"~12/min" suggested — but with only 3 shared peers to serve every node backfilling similarly, the
+rate should be expected to degrade unpredictably past ~20k ledgers deep, not stay constant. This
+is the real reason backfill is slow and unreliable, not a generically low rate: **it's a peer
+topology problem** (real full-history sources are rare and shared), which is exactly the gap this
+project's chunk-distribution approach is meant to route around.
 
 ---
 

@@ -194,16 +194,45 @@ we've actually tested.
    total (>55% at 20k) and matters least at 150k+ (checkpoint is only ~4.5% of a single chunk),
    so it's a secondary effect at the chosen size, not a reason to reconsider it.
 
-**Open blocker before 150,000 ledgers is safe to ship — not yet fixed:** `xrla-import`'s
-`write_to_nudb` step (the final combined-map write, after replay) was never streamed — only the
-*read/replay* side was fixed (see STATUS.md's streaming `ChunkReader`/`ChunkWriter` section). At
-the only scale actually tested (20,000 ledgers), that step alone peaked at **96 GB RSS** even
-after the read-side fix. 150,000 ledgers is ~7.5x more delta/transaction content than that test;
-extrapolating linearly, `write_to_nudb`'s peak could plausibly exceed **~700 GB** — nowhere close
-to fitting the 123 GB test box, and not confidently safe on larger hardware either without a real
-test. Required before shipping 150k: stream `write_to_nudb` the same way `ChunkWriter`/
-`ChunkReader` were streamed, then run a real 150,000-ledger export + import on real mainnet data
-end to end — not an extrapolation.
+**Status before shipping 150k — all fixes landed and measured at scale (2026-10-01):**
+`xrla-import`'s write path went through two rounds of fixes after the read side was streamed
+(see STATUS.md's "Real-mainnet reseed" section for the full sequence):
+
+1. `write_to_nudb` was rebuilding every node into a *second* fully-buffered map before handing
+   it to the NuDB writer. Streaming that (`write_nudb_store_streaming`) measured **96.2 GB → 64.3
+   GB peak** on the real 20,000-ledger chunk — a real fix, but still not enough: extrapolated to
+   150k that's still ~480 GB.
+2. The deeper fix: `replay_chunk`/`replay_chunk_streaming` no longer accumulate
+   `all_state_nodes`/`tx_nodes` at all. A new `NuDbSink` (in `xrla-nudb`) is written to directly
+   as each node is produced during replay — checkpoint nodes, delta-added nodes, and each
+   ledger's rebuilt tx-tree nodes all go straight to the `.dat` file and are dropped, instead of
+   being held for the whole chunk. What's left resident: the live `state` map (bounded by
+   current account-state size, not chunk length — same property that makes export cheap) plus a
+   dedup `HashSet<Hash256>` and a small per-node placement record (24 bytes each, after also
+   trimming a dead 32-byte hash field the bucket-table format never reads).
+
+   The `.dat`/`.key` write path also picked up two correctness fixes during review that have
+   nothing to do with memory and must not be lost sight of: writes now go to `.tmp` files and
+   are only renamed over the real store on success (an early version of `NuDbSink` truncated an
+   existing store immediately on `create()`, before reading a single chunk — the same class of
+   bug the `ledger.db` writer had), and duplicate nodes are now dedup-checked *before* encoding
+   rather than after, avoiding wasted work on every later chunk's checkpoint in a multi-chunk
+   import.
+
+   **Measured 2026-10-01 on real mainnet, full 150,000-ledger scale — not an extrapolation.**
+   `xrpld` was stopped on `xrpld-poc-fh-usw2-01` (NuDB's `.key` bucket file rewrites entries in
+   place via linear-hashing splits, so a live node can race a reader even on historical ranges).
+   Exported ledgers 107147192–107297191 (149,999 ledgers, one 150k chunk): 47:17 wall clock, 19.2
+   GB peak RSS (export's known `state`-map cost, unrelated to this fix), 207.8 GB output chunk.
+   Imported that chunk into a fresh store: 39:39 wall clock, **46.1 GB peak RSS**, 345,242,107
+   unique nodes written, 149,999 `ledger.db` rows, exit 0 — every ledger's `account_hash`, txn
+   authenticity, and `LedgerHash` chain verified clean. Confirms the expected effect: peak memory
+   scales with total unique node count, not chunk length.
+
+**Fallback (not needed, not built):** spilling the dedup set and placement list to temp files on
+disk via external sort would decouple peak memory from chunk size entirely, at the cost of extra
+disk passes. The 46 GB measurement above means this isn't required at 150k and is no longer a
+near-term action item.
 
 **To validate at scale (Phase 2), beyond the blocker above:** sample checkpoint sizes at older
 sequences (state was much smaller historically, so the ~10 GB figure is a today-only ceiling, not
