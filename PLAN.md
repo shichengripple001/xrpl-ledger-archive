@@ -186,13 +186,23 @@ going bigger is small, while the risk is not — see the open blocker below. 150
 a middle ground: meaningfully better than 20k on size, without jumping 25–50x past the only scale
 we've actually tested.
 
-**Two caveats on the compressed column, not yet resolved:**
-1. The 1.9–2.2× ratio is unverified at today's density/format v3 — a real measurement (compress
-   an actual 41.35 GB v3 chunk, compare) is a one-command test that hasn't been run.
-2. Checkpoint content (32-byte hashes, high-entropy) likely compresses worse than transaction/delta
-   content. This matters most at small chunk sizes where checkpoint is a large fraction of the
-   total (>55% at 20k) and matters least at 150k+ (checkpoint is only ~4.5% of a single chunk),
-   so it's a secondary effect at the chosen size, not a reason to reconsider it.
+**Compression, measured 2026-10-01** on the real 150k chunk (ledgers 107147192–107297191,
+207,777,658,069 bytes, on `xrpld-poc-fh-usw2-01`), zstd with 6 threads, output counted not stored:
+
+| Data | zstd-1 | zstd-3 | zstd-9 |
+|---|---|---|---|
+| Checkpoint (first 9 GiB) | 1.99× | 2.04× | 2.12× |
+| Middle 10 GiB (deltas + transactions) | 1.69× | 2.07× | 2.87× |
+| Last 10 GiB (deltas + transactions) | 1.83× | 2.23× | 3.02× |
+| **Whole file** | — | **2.219× (93.6 GB, 214 s)** | not run |
+
+- The ~2× assumption holds for the recent era: **93.6 GB per 150k chunk** at zstd-3.
+- The earlier hypothesis that checkpoint content compresses worse was **wrong**: it compresses
+  about as well as the rest (2.04× against 2.07–2.23× at level 3). Higher levels help the
+  delta/transaction part much more (to ~3×) than the checkpoint (2.12×).
+- Slices are samples (three offsets), and only this one era was measured. Older eras are
+  unmeasured, and a whole-file zstd-9 was not run, so the ~3× slice figures are not a whole-file
+  number.
 
 **Status before shipping 150k — all fixes landed and measured at scale (2026-10-01):**
 `xrla-import`'s write path went through two rounds of fixes after the read side was streamed
