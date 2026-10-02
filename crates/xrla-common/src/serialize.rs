@@ -261,7 +261,7 @@ impl<R: Read> Read for HashingReader<R> {
 /// node/delta/tx_map being parsed, so peak memory is whatever the caller chooses to keep
 /// (for `xrla-import`, that's just the final `state`/`all_state_nodes`/`tx_nodes`).
 ///
-/// v2 only, not v3: use `deserialize_chunk` instead — the v2 block layout (all deltas, then
+/// v3 only, not v2: use `deserialize_chunk` for v2 — the v2 block layout (all deltas, then
 /// all tx_maps) can't be streamed for the same reason `ChunkWriter` can't write it streamed;
 /// see `spec/chunk-format.md`.
 pub struct ChunkReader {
@@ -306,6 +306,12 @@ impl ChunkReader {
             stored_chunk_hash,
             deltas_remaining: end_ledger - start_ledger,
         })
+    }
+
+    /// The `chunk_hash` the header *claims*. It is only proven correct once `finish()` has
+    /// returned `Ok`; anything derived from this chunk must not be published before then.
+    pub fn chunk_hash(&self) -> Hash256 {
+        self.stored_chunk_hash
     }
 
     /// Streams the checkpoint, calling `f` once per node instead of collecting a `Vec`.

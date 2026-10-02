@@ -5,6 +5,8 @@ members = [
     "crates/xrla-export",
     "crates/xrla-import",
     "crates/xrla-inspect",
+    "crates/xrla-difftest",
+    "crates/xrla-index",
 ]
 resolver = "2"
 
