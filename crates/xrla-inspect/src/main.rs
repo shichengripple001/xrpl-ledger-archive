@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use xrla_common::chunk::TxRecord;
-use xrla_common::meta_decode::{account_id_to_classic_address, accounts_touched_by_meta};
+use xrla_common::meta_decode::{account_id_to_classic_address, affected_accounts};
 use xrla_common::serialize::deserialize_chunk;
 
 #[derive(Parser, Debug)]
@@ -171,13 +171,17 @@ fn print_tx_by_hash(chunk: &xrla_common::chunk::Chunk, hash_hex: &str) -> Result
 /// this same scan over every chunk in the range you care about — no separate index needed.
 fn print_account_tx(chunk: &xrla_common::chunk::Chunk, account_r_address: &str) -> Result<()> {
     let mut found = 0usize;
+    let mut undecodable = 0usize;
     println!("{:>12}  {:<64}", "ledger", "tx_hash");
     for tx_map in &chunk.tx_maps {
         for tx in &tx_map.txns {
-            let touched = match accounts_touched_by_meta(&tx.meta_blob) {
+            let touched = match affected_accounts(&tx.meta_blob) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("warning: skipping tx {} (meta decode failed: {e})", hex::encode_upper(tx.tx_hash));
+                    // A decode failure must never look like "no matches": count it, and fail
+                    // the command at the end so the result can't be mistaken for complete.
+                    eprintln!("error: tx {} could not be decoded: {e}", hex::encode_upper(tx.tx_hash));
+                    undecodable += 1;
                     continue;
                 }
             };
@@ -192,6 +196,9 @@ fn print_account_tx(chunk: &xrla_common::chunk::Chunk, account_r_address: &str) 
     }
     println!();
     println!("{found} transaction(s) touched {account_r_address} in ledgers {}..={}", chunk.start_ledger, chunk.end_ledger);
+    if undecodable > 0 {
+        bail!("{undecodable} transaction(s) could not be decoded — the list above is INCOMPLETE");
+    }
     Ok(())
 }
 
