@@ -40,6 +40,8 @@ const CODEC_FULL_INNER: u8 = 0x03;
 
 // NodeObjectType values stored in EncodedBlob at decoded[8] — see NodeObject.h
 const NOTYPE_UNKNOWN: u8 = 0; // inner nodes
+/// `hotLEDGER`: a ledger header, stored under the ledger's hash.
+pub const NOTYPE_LEDGER: u8 = 1;
 const NOTYPE_ACCOUNT: u8 = 3;
 const NOTYPE_TRANSACTION: u8 = 4;
 
@@ -328,6 +330,18 @@ pub fn encode_wire_to_value(content: &[u8], node_type: &NodeType) -> Vec<u8> {
         value.push(notype);
         value.extend_from_slice(content);
     }
+    value
+}
+
+/// Encode an arbitrary node object — its `NodeObjectType` byte and its data — into a NuDB stored
+/// value, using the same layout as `encode_wire_to_value`: `[codec 0x00][8 zero bytes][type][data]`.
+/// Used for objects that are not SHAMap nodes, such as the ledger header (`NOTYPE_LEDGER`).
+pub fn encode_object_to_value(object_type: u8, data: &[u8]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(1 + 8 + 1 + data.len());
+    value.push(CODEC_RAW);
+    value.extend_from_slice(&[0u8; 8]);
+    value.push(object_type);
+    value.extend_from_slice(data);
     value
 }
 

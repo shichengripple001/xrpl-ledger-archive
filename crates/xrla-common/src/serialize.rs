@@ -44,8 +44,10 @@ pub struct LedgerHashInput {
     pub close_flags: u8,
 }
 
-/// Recompute the LedgerHash: sha512half(HashPrefix::LedgerMaster ("LWR\0") + fields).
-pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
+/// The bytes that hash to the LedgerHash: `HashPrefix::LedgerMaster` ("LWR\0") followed by the
+/// header fields. xrpld also stores exactly these bytes, keyed by the ledger hash, as the
+/// ledger's `hotLEDGER` NodeObject (`saveValidatedLedger`, `Node.cpp`).
+pub fn ledger_header_object(h: &LedgerHashInput) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + 4 + 8 + 32 + 32 + 32 + 4 + 4 + 1 + 1);
     buf.extend_from_slice(&[0x4C, 0x57, 0x52, 0x00]); // HashPrefix::LedgerMaster
     buf.extend_from_slice(&h.seq.to_be_bytes());
@@ -57,7 +59,12 @@ pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
     buf.extend_from_slice(&h.close_time.to_be_bytes());
     buf.push(h.close_time_resolution);
     buf.push(h.close_flags);
-    sha512half(&buf)
+    buf
+}
+
+/// Recompute the LedgerHash: sha512half of `ledger_header_object`.
+pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
+    sha512half(&ledger_header_object(h))
 }
 
 // ---------------------------------------------------------------------------

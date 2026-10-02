@@ -32,6 +32,9 @@ use xrla_common::state_tree::verify_state_nodes;
 use xrla_common::tx_tree::{build_tx_tree, calculate_tx_id};
 use xrla_nudb::writer::NuDbSink;
 
+mod txdb;
+use txdb::TxDbSink;
+
 #[derive(Parser, Debug)]
 #[command(name = "xrla-import", about = "Import an XRLA chunk file into xrpld NuDB")]
 struct Args {
@@ -56,6 +59,13 @@ struct Args {
     /// internally and is written.
     #[arg(long)]
     ledger_db: Option<PathBuf>,
+
+    /// Path to write xrpld's transaction.db (`Transactions` + `AccountTransactions`), which
+    /// xrpld answers `account_tx` and `tx` from. Also writes each ledger's header into the
+    /// NuDB store so xrpld can load imported ledgers by hash. Refuses an existing file. Roughly
+    /// 40 GB per 150k-ledger chunk.
+    #[arg(long)]
+    txdb: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -71,6 +81,10 @@ fn main() -> Result<()> {
     // `all_state_nodes.entry().or_insert()` union used to do — without holding that union.
     let mut sink = NuDbSink::create(&args.dat)?;
     let mut ledger_rows: Vec<LedgerDbRow> = Vec::new();
+    let mut txdb: Option<TxDbSink> = match &args.txdb {
+        Some(p) => Some(TxDbSink::create(p)?),
+        None => None,
+    };
 
     for chunk_path in &args.chunk {
         println!("Reading chunk: {}", chunk_path.display());
@@ -79,7 +93,7 @@ fn main() -> Result<()> {
         // can't be streamed (see spec/chunk-format.md) and fall back to the original
         // read-whole-file-then-parse path.
         let replay = if detect_version(chunk_path)? == FORMAT_VERSION_STREAMED {
-            replay_chunk_streaming(chunk_path, !args.skip_verify, &mut sink)?
+            replay_chunk_streaming(chunk_path, !args.skip_verify, &mut sink, &mut txdb)?
         } else {
             let data = fs::read(chunk_path)?;
             println!("Deserializing and verifying chunk (v2, buffered)...");
@@ -89,7 +103,7 @@ fn main() -> Result<()> {
                 chunk.network_id, chunk.start_ledger, chunk.end_ledger, chunk.ledger_count()
             );
             println!("Chunk hash OK: {}", hex::encode(chunk.chunk_hash));
-            replay_chunk(&chunk, !args.skip_verify, &mut sink)?
+            replay_chunk(&chunk, !args.skip_verify, &mut sink, &mut txdb)?
         };
 
         println!(
@@ -101,6 +115,11 @@ fn main() -> Result<()> {
     }
 
     println!("  {} unique nodes total", sink.node_count());
+    if let Some(t) = txdb.take() {
+        let (n_tx, n_acct) = t.counts();
+        println!("Building transaction.db indexes ({n_tx} transactions, {n_acct} account rows)...");
+        t.finish()?;
+    }
     sink.finish(&key_path)?;
 
     if let Some(ledger_db_path) = &args.ledger_db {
@@ -153,6 +172,33 @@ struct ReplayResult {
 
 /// Encode a node into its NuDB on-disk value and hand it to the sink, which writes it to
 /// the `.dat` file immediately. The encoded `Vec<u8>` lives only for this call.
+/// With `--txdb`: store the ledger header as the NuDB object xrpld looks up by LedgerHash, and
+/// write the ledger's transaction rows. A no-op without `--txdb`.
+fn write_ledger_outputs(
+    sink: &mut NuDbSink,
+    txdb: &mut Option<TxDbSink>,
+    tx_map: &TxMap,
+    parent_hash: Hash256,
+    tx_hash: Hash256,
+    account_hash: Hash256,
+) -> Result<()> {
+    let Some(t) = txdb.as_mut() else { return Ok(()) };
+    let header = xrla_common::serialize::ledger_header_object(&LedgerHashInput {
+        seq: tx_map.ledger_seq,
+        drops: tx_map.drops,
+        parent_hash,
+        tx_hash,
+        account_hash,
+        parent_close_time: tx_map.parent_close_time,
+        close_time: tx_map.close_time,
+        close_time_resolution: tx_map.close_time_resolution,
+        close_flags: tx_map.close_flags,
+    });
+    let value = xrla_nudb::dat::encode_object_to_value(xrla_nudb::dat::NOTYPE_LEDGER, &header);
+    sink.write_node(tx_map.ledger_hash, &value)?;
+    t.write_ledger(tx_map)
+}
+
 fn sink_node(sink: &mut NuDbSink, node: &SHAMapNode) -> Result<()> {
     // Check before encoding: on a multi-chunk import every later chunk's checkpoint repeats
     // ~28M nodes the previous chunk already wrote, and encoding just to discard is wasted work.
@@ -167,7 +213,12 @@ fn sink_node(sink: &mut NuDbSink, node: &SHAMapNode) -> Result<()> {
 /// When `verify` is true, independently recomputes and asserts (bailing on the first
 /// mismatch): per-transaction authenticity, the account-state root, and the full
 /// LedgerHash chained to the previous ledger.
-fn replay_chunk(chunk: &Chunk, verify: bool, sink: &mut NuDbSink) -> Result<ReplayResult> {
+fn replay_chunk(
+    chunk: &Chunk,
+    verify: bool,
+    sink: &mut NuDbSink,
+    txdb: &mut Option<TxDbSink>,
+) -> Result<ReplayResult> {
     let mut state: HashMap<Hash256, Rc<SHAMapNode>> = chunk
         .checkpoint
         .iter()
@@ -200,6 +251,9 @@ fn replay_chunk(chunk: &Chunk, verify: bool, sink: &mut NuDbSink) -> Result<Repl
                 hex::encode(bad_hash)
             );
         }
+    }
+    if let Some(t) = txdb.as_mut() {
+        t.write_ledger(cp)?;
     }
     let (_, nodes) = build_tx_tree(&cp.txns);
     for node in &nodes {
@@ -296,6 +350,7 @@ fn replay_chunk(chunk: &Chunk, verify: bool, sink: &mut NuDbSink) -> Result<Repl
             );
         }
 
+        write_ledger_outputs(sink, txdb, &tx_map, prev_ledger_hash, tx_hash, new_root)?;
         ledger_rows.push(LedgerDbRow {
             ledger_hash: tx_map.ledger_hash,
             ledger_seq: tx_map.ledger_seq,
@@ -336,6 +391,7 @@ fn replay_chunk_streaming(
     path: &std::path::Path,
     verify: bool,
     sink: &mut NuDbSink,
+    txdb: &mut Option<TxDbSink>,
 ) -> Result<ReplayResult> {
     let mut reader = ChunkReader::open(path)?;
     println!(
@@ -383,6 +439,9 @@ fn replay_chunk_streaming(
     }
     if verify {
         verify_txns_authentic(&cp)?;
+    }
+    if let Some(t) = txdb.as_mut() {
+        t.write_ledger(&cp)?;
     }
     let (_, nodes) = build_tx_tree(&cp.txns);
     for node in &nodes {
@@ -475,6 +534,7 @@ fn replay_chunk_streaming(
             );
         }
 
+        write_ledger_outputs(sink, txdb, &tx_map, prev_ledger_hash, tx_hash, new_root)?;
         ledger_rows.push(LedgerDbRow {
             ledger_hash: tx_map.ledger_hash,
             ledger_seq: tx_map.ledger_seq,
@@ -716,7 +776,7 @@ mod tests {
         };
 
         let (mut sink, sink_dir) = temp_sink("two_ledger");
-        let replay = replay_chunk(&chunk, true, &mut sink).expect("replay + verify should succeed");
+        let replay = replay_chunk(&chunk, true, &mut sink, &mut None).expect("replay + verify should succeed");
         assert_eq!(replay.state.len(), 2, "final live state should be exactly ledger B's nodes");
         assert!(replay.state.contains_key(&leaf_b.hash));
         assert!(replay.state.contains_key(&root_b.hash));
@@ -726,7 +786,7 @@ mod tests {
         let mut bad_chunk = chunk;
         bad_chunk.tx_maps[1].ledger_hash[0] ^= 0xFF;
         let (mut bad_sink, bad_sink_dir) = temp_sink("two_ledger_bad");
-        let err = replay_chunk(&bad_chunk, true, &mut bad_sink).unwrap_err();
+        let err = replay_chunk(&bad_chunk, true, &mut bad_sink, &mut None).unwrap_err();
         assert!(
             err.to_string().contains("LedgerHash"),
             "expected a LedgerHash mismatch error, got: {err}"
@@ -816,7 +876,7 @@ mod tests {
         };
         let (mut buf_sink, buf_dir) = temp_sink("cmp_buffered");
         let buffered =
-            replay_chunk(&chunk, true, &mut buf_sink).expect("buffered replay should succeed");
+            replay_chunk(&chunk, true, &mut buf_sink, &mut None).expect("buffered replay should succeed");
         let buffered_nodes = buf_sink.node_count();
 
         let dir = std::env::temp_dir()
@@ -843,7 +903,7 @@ mod tests {
         writer.finish().unwrap();
 
         let (mut str_sink, str_dir) = temp_sink("cmp_streamed");
-        let streamed = replay_chunk_streaming(&path, true, &mut str_sink)
+        let streamed = replay_chunk_streaming(&path, true, &mut str_sink, &mut None)
             .expect("streaming replay should succeed");
         let streamed_nodes = str_sink.node_count();
 
@@ -880,7 +940,7 @@ mod tests {
         bad_writer.write_tx_map(&bad_tx_map_b).unwrap();
         bad_writer.finish().unwrap();
         let (mut bad2_sink, bad2_dir) = temp_sink("cmp_bad");
-        let err = replay_chunk_streaming(&bad_path, true, &mut bad2_sink).unwrap_err();
+        let err = replay_chunk_streaming(&bad_path, true, &mut bad2_sink, &mut None).unwrap_err();
         assert!(
             err.to_string().contains("LedgerHash"),
             "expected a LedgerHash mismatch error, got: {err}"

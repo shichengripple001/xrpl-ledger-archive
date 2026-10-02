@@ -379,6 +379,52 @@ pub fn summarize_meta(meta_blob: &[u8]) -> Result<MetaSummary> {
     Ok(MetaSummary { affected_accounts: accounts.into_iter().collect(), transaction_index })
 }
 
+/// The three transaction fields xrpld's `Transactions` row needs besides the blobs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TxFields {
+    /// `sfTransactionType` (UINT16, 2); see `tx_types::tx_type_name`.
+    pub tx_type: u16,
+    /// `sfAccount` (ACCOUNT, 1): the sender. A pseudo-transaction's is the zero account.
+    pub account: [u8; 20],
+    /// `sfSequence` (UINT32, 4): 0 for a ticketed transaction.
+    pub sequence: u32,
+}
+
+/// Read `TransactionType`, `Sequence` and `Account` from a serialized transaction.
+///
+/// Fields are serialized in (type, field) order and `Account` is type 8, so all three precede any
+/// array, object or path set and the scan stops as soon as it has them — nothing after is parsed.
+pub fn parse_tx_fields(tx_blob: &[u8]) -> Result<TxFields> {
+    let mut c = Cursor { b: tx_blob, i: 0 };
+    let (mut tx_type, mut sequence, mut account) = (None, None, None);
+    while tx_type.is_none() || sequence.is_none() || account.is_none() {
+        if c.eof() {
+            bail!("transaction ended before TransactionType, Sequence and Account were all found");
+        }
+        let (t, f) = c.read_field_header()?;
+        match (t, f) {
+            (TYPE_UINT16, 2) => {
+                let b = c.take(2)?;
+                tx_type = Some(u16::from_be_bytes([b[0], b[1]]));
+            }
+            (TYPE_UINT32, 4) => {
+                let b = c.take(4)?;
+                sequence = Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            (TYPE_ACCOUNT, 1) => account = Some(read_account(&mut c)?.unwrap_or([0u8; 20])),
+            _ if t > TYPE_ACCOUNT => {
+                bail!("reached field type {t} before finding TransactionType, Sequence and Account")
+            }
+            _ => skip_value(&mut c, t)?,
+        }
+    }
+    Ok(TxFields {
+        tx_type: tx_type.unwrap(),
+        account: account.unwrap(),
+        sequence: sequence.unwrap(),
+    })
+}
+
 /// The accounts xrpld records for this transaction in `AccountTransactions`.
 pub fn affected_accounts(meta_blob: &[u8]) -> Result<Vec<[u8; 20]>> {
     Ok(summarize_meta(meta_blob)?.affected_accounts)
@@ -768,6 +814,38 @@ mod tests {
         assert!(classic_address_to_account_id("rHb9CJAWyB4rj91VRWn96Dkuk0G4bwdtyTh").is_err());
         assert!(classic_address_to_account_id("").is_err());
         assert!(classic_address_to_account_id("r").is_err());
+    }
+
+    #[test]
+    fn tx_fields_are_read_in_front_of_everything_that_cannot_be_skipped() {
+        // Real field order: TransactionType, Flags, Sequence, ..., SigningPubKey (VL), Account,
+        // Destination — then a Memos array and a Paths path set that must never be touched.
+        let blob = cat(&[
+            u16f(2, 0),                              // TransactionType = Payment
+            u32f(2, 0x8000_0000),                    // Flags
+            u32f(4, 77),                             // Sequence
+            amt_native(1),                           // Amount
+            {
+                let mut v = hdr(TYPE_VL, 3); // SigningPubKey
+                v.push(2);
+                v.extend([0xAA, 0xBB]);
+                v
+            },
+            acct(1, a(5)),                           // Account
+            acct(3, a(6)),                           // Destination
+            hdr(18, 1),                              // a PATHSET after Account: unparseable here
+        ]);
+        let f = parse_tx_fields(&blob).unwrap();
+        assert_eq!(f, TxFields { tx_type: 0, account: a(5), sequence: 77 });
+
+        // A ticketed transaction has Sequence 0, which is a value, not "missing".
+        let ticketed = cat(&[u16f(2, 7), u32f(4, 0), acct(1, a(2))]);
+        assert_eq!(parse_tx_fields(&ticketed).unwrap().sequence, 0);
+
+        // Anything missing is an error, never a default.
+        assert!(parse_tx_fields(&cat(&[u16f(2, 0), acct(1, a(5))])).is_err());
+        assert!(parse_tx_fields(&[]).is_err());
+        assert!(parse_tx_fields(&cat(&[u16f(2, 0), u32f(4, 1), hdr(14, 3)])).is_err());
     }
 
     #[test]
