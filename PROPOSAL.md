@@ -31,9 +31,6 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 - **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
   sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
   it, and nothing downstream, Clio included, can recover it.
-- **It can't be handed over in pieces.** Operators can't share history or take just a range; it is
-  all or nothing. History sharding, the official attempt, was removed in xrpld 2.3.0 because every
-  shard duplicated unchanged tree nodes.
 - **There is no verified, bulk form.** Clio returns database rows, with no way to prove they belong
   to a ledger's state without trusting the database and the pipeline that wrote it. Its API is
   point queries, so a historical time series is N round trips.
