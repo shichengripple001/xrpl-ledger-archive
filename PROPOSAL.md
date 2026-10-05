@@ -9,12 +9,18 @@ real node), or **estimate** (arithmetic, not yet confirmed). Estimates are liste
 
 ## The problem
 
-Full XRPL history can't be obtained, can't be verified in bulk, and costs a lot to serve.
+Full XRPL history is hard to distribute, hard to keep current, and expensive to run and serve.
 
-- **It is huge and slow to copy.** A full-history node is **32 TB NuDB + 11 TB `transaction.db` +
-  296 GB `ledger.db`** (observed, 2026-09-29), growing ~12 GB/day. The only route is P2P backfill.
-  On a real node only 3 of 16 peers held deep history, and the rate degrades past ~20k ledgers deep
-  (both measured). A full backfill takes months (**estimate**, never measured end to end).
+- **It is hard to distribute.** A full-history node holds **32 TB NuDB + 11 TB `transaction.db` +
+  296 GB `ledger.db`** (observed, 2026-09-29). Someone who wants to run one has two options: get a
+  copy from XRPL Commons and download the entire database, or backfill from peers with xrpld. Either
+  takes months (**estimate**, never measured end to end).
+- **Every new snapshot starts from scratch.** There is no incremental way to publish history. To
+  produce a new snapshot you stop the service, compress the whole database, split the compressed
+  file, and upload all of it. The process is tedious and takes weeks.
+- **Running a full-history node is expensive and can't grow forever.** We run it on an
+  i3en.24xlarge, which has 60 TB of local NVMe. The node already uses ~43 TB and grows ~12 GB/day
+  (observed). Disk is a hard ceiling on one machine.
 - **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
   sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
   it, and nothing downstream, Clio included, can recover it.
