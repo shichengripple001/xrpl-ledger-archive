@@ -20,9 +20,8 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
   file, and upload all of it. The process is tedious and takes weeks.
 - **Running a full-history node is expensive and can't grow forever.** We run it on an
   i3en.24xlarge, which has 60 TB of local NVMe. The node already uses ~43 TB and grows ~12 GB/day
-  (observed). Disk is a hard ceiling on one machine. Cost per node: $10.848/hour on demand
-  (us-west-2, AWS price list), which is ~$7.9k/month or ~$95k/year; with our 50% savings plan,
-  ~$4.0k/month or ~$47.5k/year. A second full-history node doubles that.
+  (observed). Disk is a hard ceiling on one machine. Anyone running one pays
+  $10.848/hour on demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node.
 - **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
   sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
   it, and nothing downstream, Clio included, can recover it.
