@@ -93,7 +93,8 @@ three ways:
   xrpld until the next chunk is built.
 - Route each request to a server that holds the ledger range it needs, so history can be split
   across servers by range and the service scales by adding servers.
-- Rebuild from the archive in parallel, and lose a server without a long re-ingest.
+- If a server is lost or the index format changes, rebuild from the chunks, many at the same time,
+  instead of re-ingesting ledger by ledger.
 - Replace Clio's ScyllaDB tier, so there is no Cassandra-compatible database to run.
 
 ## Stage 1 — Archive service
