@@ -7,24 +7,11 @@ Design detail lives in [PLAN.md](PLAN.md), evidence in [STATUS.md](STATUS.md), p
 Numbers are tagged **measured** (we ran it), **observed** (read from production dashboards or a
 real node), or **estimate** (arithmetic, not yet confirmed). Estimates are listed again at the end.
 
-## Summary
-
-Full XRPL history today is a ~43 TB, months-long P2P backfill that only works from a few peers.
-We propose two stages:
-
-1. **Archive service.** Publish the whole history as hash-verified chunks that anyone can download
-   from S3 or BitTorrent and use to seed a node in hours. The core of this already works.
-2. **Query layer.** Build a Clio-compatible API on top of the archive, so the archive replaces
-   Clio's ScyllaDB tier (~$232k/year across devnet, testnet and mainnet) and the sequential
-   ingest that fills it.
-
-Stage 1 is useful by itself and is the input to Stage 2. We do not need to commit to Stage 2 to
-ship Stage 1.
-
 ## The problem
 
 Full XRPL history is hard to get, can't be verified or exported in bulk, and is expensive to serve.
-Those are two separate problems, one per stage.
+Those are two separate problems. The proposal has two stages, one per problem: Stage 1 an archive
+service, Stage 2 a query layer on top of it. Stage 1 is useful by itself and is the input to Stage 2.
 
 **Stage 1: an operator who needs full history has no good way to get it.**
 
