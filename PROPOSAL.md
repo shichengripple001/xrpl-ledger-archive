@@ -42,6 +42,8 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 - **The database tier is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet
   and mainnet**. The mainnet-only figure is not known.
+- **The database is hard to operate.** Clio needs a Cassandra-compatible database (ScyllaDB), and
+  managing one is difficult for node operators.
 - **Its database is as hard to hand over as xrpld's, or harder.** To share it you export the
   database and audit its integrity, and the recipient imports it and audits again. Apart from
   hosting ScyllaDB yourself, there is no practical way to get the data.
