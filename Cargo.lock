@@ -520,6 +520,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "xrla-difftest"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "rusqlite",
+ "xrla-common",
+ "xrla-index",
+]
+
+[[package]]
 name = "xrla-export"
 version = "0.1.0"
 dependencies = [
@@ -541,6 +552,17 @@ dependencies = [
  "rusqlite",
  "xrla-common",
  "xrla-nudb",
+]
+
+[[package]]
+name = "xrla-index"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "hex",
+ "rusqlite",
+ "xrla-common",
 ]
 
 [[package]]

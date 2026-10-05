@@ -44,8 +44,10 @@ pub struct LedgerHashInput {
     pub close_flags: u8,
 }
 
-/// Recompute the LedgerHash: sha512half(HashPrefix::LedgerMaster ("LWR\0") + fields).
-pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
+/// The bytes that hash to the LedgerHash: `HashPrefix::LedgerMaster` ("LWR\0") followed by the
+/// header fields. xrpld also stores exactly these bytes, keyed by the ledger hash, as the
+/// ledger's `hotLEDGER` NodeObject (`saveValidatedLedger`, `Node.cpp`).
+pub fn ledger_header_object(h: &LedgerHashInput) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + 4 + 8 + 32 + 32 + 32 + 4 + 4 + 1 + 1);
     buf.extend_from_slice(&[0x4C, 0x57, 0x52, 0x00]); // HashPrefix::LedgerMaster
     buf.extend_from_slice(&h.seq.to_be_bytes());
@@ -57,7 +59,12 @@ pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
     buf.extend_from_slice(&h.close_time.to_be_bytes());
     buf.push(h.close_time_resolution);
     buf.push(h.close_flags);
-    sha512half(&buf)
+    buf
+}
+
+/// Recompute the LedgerHash: sha512half of `ledger_header_object`.
+pub fn calculate_ledger_hash(h: &LedgerHashInput) -> Hash256 {
+    sha512half(&ledger_header_object(h))
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +268,7 @@ impl<R: Read> Read for HashingReader<R> {
 /// node/delta/tx_map being parsed, so peak memory is whatever the caller chooses to keep
 /// (for `xrla-import`, that's just the final `state`/`all_state_nodes`/`tx_nodes`).
 ///
-/// v2 only, not v3: use `deserialize_chunk` instead — the v2 block layout (all deltas, then
+/// v3 only, not v2: use `deserialize_chunk` for v2 — the v2 block layout (all deltas, then
 /// all tx_maps) can't be streamed for the same reason `ChunkWriter` can't write it streamed;
 /// see `spec/chunk-format.md`.
 pub struct ChunkReader {
@@ -306,6 +313,12 @@ impl ChunkReader {
             stored_chunk_hash,
             deltas_remaining: end_ledger - start_ledger,
         })
+    }
+
+    /// The `chunk_hash` the header *claims*. It is only proven correct once `finish()` has
+    /// returned `Ok`; anything derived from this chunk must not be published before then.
+    pub fn chunk_hash(&self) -> Hash256 {
+        self.stored_chunk_hash
     }
 
     /// Streams the checkpoint, calling `f` once per node instead of collecting a `Vec`.

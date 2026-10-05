@@ -1,0 +1,19 @@
+[package]
+name    = "xrla-index"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "xrla_index"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xrla-index"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+hex         = { workspace = true }
+rusqlite    = { version = "0.31", features = ["bundled"] }
+xrla-common = { path = "../xrla-common" }
