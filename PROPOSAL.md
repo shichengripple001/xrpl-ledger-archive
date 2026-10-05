@@ -89,6 +89,8 @@ three ways:
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
   forwarding writes.
 - Include the newest ledgers through a live tail, not only sealed chunks.
+- Route each request to a server that holds the ledger range it needs, so history can be split
+  across servers by range and the service scales by adding servers.
 - Rebuild from the archive in parallel, and lose a server without a long re-ingest.
 - Replace Clio's ScyllaDB tier, so there is no Cassandra-compatible database to run.
 
