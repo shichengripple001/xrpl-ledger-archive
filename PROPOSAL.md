@@ -9,11 +9,7 @@ real node), or **estimate** (arithmetic, not yet confirmed). Estimates are liste
 
 ## The problem
 
-Full XRPL history is hard to get, can't be verified or exported in bulk, and is expensive to serve.
-Those are two separate problems. The proposal has two stages, one per problem: Stage 1 an archive
-service, Stage 2 a query layer on top of it. Stage 1 is useful by itself and is the input to Stage 2.
-
-**Stage 1: an operator who needs full history has no good way to get it.**
+Full XRPL history can't be obtained, can't be verified in bulk, and costs a lot to serve.
 
 - **It is huge and slow to copy.** A full-history node is **32 TB NuDB + 11 TB `transaction.db` +
   296 GB `ledger.db`** (observed, 2026-09-29), growing ~12 GB/day. The only route is P2P backfill.
@@ -28,40 +24,31 @@ service, Stage 2 a query layer on top of it. Stage 1 is useful by itself and is 
 - **There is no verified, bulk form.** Clio returns database rows, with no way to prove they belong
   to a ledger's state without trusting the database and the pipeline that wrote it. Its API is
   point queries, so a historical time series is N round trips.
+- **Serving it is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet and
+  mainnet**. The mainnet-only figure is not known. Observed on mainnet Clio over 7 days: ~1,760 req/s
+  average, flat for 90 days; about 90% is current-state traffic, and `account_tx` and `tx` together
+  are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94% stay within
+  the last ~5 days, and only ~5% reach back more than ~46 days. Current state is served from memory
+  (97.7% cache hit rate, ~12-13 GB per node), not from the database. The database mostly holds
+  history that few requests touch.
+- **The store is slow to change.** It is filled by sequential ingest from a live rippled. We found no
+  offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
+  schema means re-ingesting history ledger by ledger; how long that takes is not measured.
+- **Copying the history into a node doesn't give you account history.** A node seeded from the
+  archive serves state and ledgers at once, but `account_tx` on the imported ledgers needs rows in
+  xrpld's `transaction.db` (`xrla-import --txdb` now writes them) and an unbroken run of ledgers
+  from the import to the live tip. A chunk is ~7 days of mainnet and ends days behind the tip, so
+  xrpld has to fetch the gap from peers. Measured: 13.5 h for a 71k-ledger gap (~100 ledgers/min
+  from 32 peers; disk and CPU idle), against ~4 min for a 763-ledger gap.
 - **The demand is real.** The anchor case: a market-making firm couldn't get what it needed from
   Clio's full-history mode and asked for a full-history xrpld node directly (CONTEXT.md).
 
-**Stage 2: serving history the way Clio does is costly and slow to change.**
-
-- **Cost.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet and mainnet**. The
-  mainnet-only figure is not known.
-- **The traffic doesn't look like what the tier is for** (observed, mainnet Clio, 7 days):
-  ~1,760 req/s average, flat for 90 days. About 90% is current-state traffic. `account_tx` and `tx`
-  together are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94%
-  stay within the last ~5 days, and only ~5% reach back more than ~46 days.
-- **Current state is served from memory, not the database.** Each Clio read node holds the whole
-  current state in RAM (observed: 97.7% cache hit rate, ~12–13 GB per node), which is how one node
-  carries ~350 req/s. xrpld isn't built for that volume (not measured here), which is why Clio exists.
-- **It is slow to change.** The store is filled by sequential ingest from a live rippled. We found
-  no offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
-  schema means re-ingesting history ledger by ledger; how long that takes is not measured.
-- **The archive alone doesn't replace it.** A node seeded from the archive serves state and ledgers
-  at once. `account_tx` on the imported history needs two things: rows in xrpld's `transaction.db`
-  (`xrla-import --txdb` now writes them, see below) and an unbroken run of ledgers from the import
-  to the live tip. A chunk is ~7 days of mainnet, so the chunk always ends days behind the tip and
-  xrpld has to fetch the gap from peers. Measured: 13.5 h for a 71k-ledger gap (~100 ledgers/min,
-  about 1.7/s, from 32 peers; disk and CPU idle), against ~4 min for a 763-ledger gap. Chunks that
-  end near the tip remove the wait.
-
 ### What a solution has to do
 
-Stage 1:
 - Let an operator fetch all of history or just a range, from any source, and verify every chunk
   against on-chain hashes without trusting where it came from.
 - Seed a working node from it in hours, not months (import is measured at 39 minutes per 150k chunk;
   the whole archive is not measured).
-
-Stage 2:
 - Serve `account_tx` and `tx` for all history at roughly Clio's latency (observed 7-day mean:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
