@@ -242,7 +242,7 @@ tried or estimated.
 |---|---|
 | **Shard** | A server (a modified Clio or the new service) serving one ledger range from stores built from that range's chunks. Run with replicas. |
 | **Newest shard** | Serves the latest ledgers and current state, fed live from xrpld as Clio is today. When a chunk is sealed, its range moves to a sealed shard. How it stores the not-yet-sealed ledgers is not decided. |
-| **Router** | Sends each request to the shard holding its ledger. Walks `account_tx` across shards, newest first, until the limit is filled. Finds `tx` by hash through one global hash-to-ledger index (a `ctid` already contains the ledger, so needs none). |
+| **Router** | Sends each request to the shard holding its ledger. A range that spans shards (`account_tx`, `nft_history`) is split at the shard boundary: it asks the newest shard first, then older ones until the limit is filled, and the paging marker's ledger number says which shard to continue on. Shards do not overlap, so the order matches a single server. Finds `tx` by hash through one global hash-to-ledger index (a `ctid` already contains the ledger, so needs none). |
 | **xrpld** | Feeds new ledgers and answers the forwarded methods. |
 
 ### What each shard must hold
