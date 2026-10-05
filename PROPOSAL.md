@@ -72,6 +72,9 @@ three ways:
 - Never silently drop a transaction from an account's history.
 
 **2. Download chunks and spin up an xrpld node**
+- Not only for full history. A normal P2P xrpld node that needs a longer history than it holds can
+  import just the range it needs from chunks, instead of waiting for peers to supply it. Full
+  history is the case where the range is everything.
 - Seed a working node in days, not months: download is hours on a fast link, and import is measured
   at 39 minutes per recent 150k chunk, at most ~19 days for the whole archive (estimate, see "Size
   and time").
