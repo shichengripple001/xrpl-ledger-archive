@@ -88,7 +88,9 @@ three ways:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
   forwarding writes.
-- Include the newest ledgers through a live tail, not only sealed chunks.
+- Serve the newest ledgers too. A chunk is only built after its 150,000 ledgers (about a week) have
+  closed, so the latest days are in no chunk yet; the service has to pick them up from a running
+  xrpld until the next chunk is built.
 - Route each request to a server that holds the ledger range it needs, so history can be split
   across servers by range and the service scales by adding servers.
 - Rebuild from the archive in parallel, and lose a server without a long re-ingest.
