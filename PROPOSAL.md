@@ -184,23 +184,15 @@ memory across hundreds of chunks (it grows with unique nodes; 46 GB is for one),
 looks at chunk boundaries (the importer does not write a chunk's first ledger), and parallel
 imports.
 
-### Limits to state up front
+### Limits
 
-- A seeded node serves state and ledgers immediately. `xrla-import --txdb` also writes xrpld's
-  `transaction.db` (Transactions + AccountTransactions) and each ledger's header object, so
-  `account_tx` works on imported history as soon as the imported range joins the live tip. Until
-  then xrpld returns `lgrIdxsInvalid`: the gap between the chunk's end and the tip is fetched from
-  peers (13.5 h for a 71k-ledger gap, measured). Import cost for a 150k chunk: 47 min with
-  `--txdb` against 39 min without, 38 GB `transaction.db`, 46 GB peak memory.
-- Measured per 150k chunk: 17,512,432 transactions, 34,997,796 account rows (2.0 per transaction),
-  index build 13:52 and 5.07 GB (SQLite, unpacked).
-- Verified on the 150k chunk against s2.ripple.com (Clio, full history): `account_tx` lists for
-  10,000 random accounts (926,903 rows, same hashes, same order) and the stored transaction and
-  metadata bytes of 10,000 random transactions, 0 differences. On the 5k chunk the import's rows
-  matched xrpld's own rows exactly (275,510 transactions, 527,613 account rows).
-- Import memory grows with the number of unique nodes imported (46 GB for one 150k chunk). How it
-  scales to a many-chunk, full-history import is not measured. The export source must also be
-  stopped while it is read.
+- **Account history on a seeded node waits for the gap.** `account_tx` on imported ledgers works
+  only once the imported range joins the live tip. Until then xrpld returns `lgrIdxsInvalid`, and it
+  fetches the gap from peers (13.5 hours for about 71,000 ledgers, measured). Chunks that end near
+  the tip shorten the wait.
+- **Memory for a many-chunk import is not measured.** Import memory grows with the number of unique
+  tree nodes (46 GB for one chunk); the figure for the whole history is unknown.
+- **Export needs the source node stopped** while its database files are read.
 
 ### Done when
 
