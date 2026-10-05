@@ -11,6 +11,8 @@ real node), or **estimate** (arithmetic, not yet confirmed). Estimates are liste
 
 Full XRPL history is hard to distribute, hard to keep current, and expensive to run and serve.
 
+### Getting full history
+
 - **It is hard to distribute.** A full-history node holds **32 TB NuDB + 11 TB `transaction.db` +
   296 GB `ledger.db`** (observed, 2026-09-29). Someone who wants to run one has two options: get a
   copy from XRPL Commons and download the entire database, or backfill from peers with xrpld. Either
@@ -18,33 +20,33 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 - **Every new snapshot starts from scratch.** There is no incremental way to publish history. To
   produce a new snapshot you stop the service, compress the whole database, split the compressed
   file, and upload all of it. The process is tedious and takes weeks.
-- **Running a full-history node is expensive and can't grow forever.** We run it on an
-  i3en.24xlarge, which has 60 TB of local NVMe. The node already uses ~43 TB and grows ~12 GB/day
-  (observed). Disk is a hard ceiling on one machine. Anyone running one pays
-  $10.848/hour on demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node.
-  This is the instance only; data transfer and backups are not included.
-- **The data is lost when the instance stops.** The i3en's disks are local NVMe (instance store),
-  and their contents are lost when the instance is stopped or terminated, or when the underlying
-  host fails. Keeping the data safe means keeping a backup, which is not in the cost above. With no
-  backup, recovery is a full re-download or backfill of ~43 TB, which takes months. Every new
-  snapshot also means stopping the service (see above).
-- **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
-  sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
-  it, and nothing downstream, Clio included, can recover it.
-- **There is no verified, bulk form.** Clio returns database rows, with no way to prove they belong
-  to a ledger's state without trusting the database and the pipeline that wrote it. Its API is
-  point queries, so a historical time series is N round trips.
-- **Serving it is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet and
-  mainnet**. The mainnet-only figure is not known. Observed on mainnet Clio over 7 days: ~1,760 req/s
-  average, flat for 90 days; about 90% is current-state traffic, and `account_tx` and `tx` together
+- **There is no verified form.** Clio returns database rows, with no way to prove they belong to a
+  ledger's state without trusting the database and the pipeline that wrote it.
+
+### Running a full-history node
+
+- **It is expensive.** We run it on an i3en.24xlarge. Anyone running one pays $10.848/hour on
+  demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node. This is the instance only;
+  data transfer and backups are not included.
+- **It can't grow forever.** The i3en.24xlarge has 60 TB of local NVMe. The node already uses
+  ~43 TB and grows ~12 GB/day (observed). Disk is a hard ceiling on one machine.
+- **The data is lost when the instance stops.** The disks are local NVMe (instance store), and
+  their contents are lost when the instance is stopped or terminated, or when the underlying host
+  fails. Keeping the data safe means keeping a backup, which is not in the cost above. With no
+  backup, recovery is a full re-download or backfill of ~43 TB, which takes months.
+
+### Serving it through Clio
+
+- **The database tier is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet
+  and mainnet**. The mainnet-only figure is not known.
+- **The traffic doesn't match what the tier is for** (observed, mainnet Clio, 7 days): ~1,760 req/s
+  average, flat for 90 days. About 90% is current-state traffic, and `account_tx` and `tx` together
   are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94% stay within
   the last ~5 days, and only ~5% reach back more than ~46 days. Current state is served from memory
   (97.7% cache hit rate, ~12-13 GB per node), not from the database.
-- **The store is slow to change.** It is filled by sequential ingest from a live rippled. We found no
-  offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
+- **It is slow to change.** The store is filled by sequential ingest from a live rippled. We found
+  no offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
   schema means re-ingesting history ledger by ledger; how long that takes is not measured.
-- **The demand is real.** The anchor case: a market-making firm couldn't get what it needed from
-  Clio's full-history mode and asked for a full-history xrpld node directly (CONTEXT.md).
 
 ### What a solution has to do
 
