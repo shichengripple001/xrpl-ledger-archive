@@ -281,16 +281,14 @@ run.
   ~32 TB. Optional; not needed to match Clio.
 - `subscribe` comes from xrpld; path finding and `submit` are forwarded, as Clio does today.
 
-### How we prove it is right
+### How we check it gives the right answers
 
-- **Account history is already checked:** our rule for which accounts a transaction touched matched
-  xrpld on ~3.9 million transactions, and on the 150k chunk account histories matched s2.ripple.com
-  for 10,000 accounts and the stored bytes for 10,000 transactions, with zero differences.
-- **Each new store is checked the same way:** sampled requests compared with real xrpld nodes and
-  with Clio, reporting missing and extra results separately.
-- **Shadow traffic:** replay real Clio requests against the new stack and compare answers and
-  latency before any cutover. Target: no data mismatches, latency within Clio's today (7-day mean:
-  `account_tx` 21 ms, `tx` 3 ms).
+- **While building:** each store is checked by sending sample requests to it and to real xrpld nodes
+  and Clio, and comparing the answers. Missing and extra results are counted separately. This is
+  how account history was checked (see "What already works").
+- **Before switching users over:** send copies of real Clio requests to the new service as well, and
+  compare its answers and speed with Clio's. Users move only when the answers match and it is as fast
+  as Clio is today (7-day average: `account_tx` 21 ms, `tx` 3 ms).
 
 ### Done when
 
