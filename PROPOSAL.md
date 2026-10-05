@@ -107,8 +107,9 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 
 ### What already works (measured)
 
-- **Export** reads a stopped xrpld's NuDB store directly. One real 150k chunk
-  (ledgers 107,147,192–107,297,191): **47 min, 19.2 GB peak RAM, 207.8 GB chunk**.
+- **Export** creates a chunk from a full-history node's database files, and xrpld has to be stopped
+  while it reads them. We exported one real chunk of 150,000 ledgers (107,147,192 to 107,297,191):
+  **47 minutes, up to 19.2 GB of memory, a 207.8 GB file**.
 - **Import** into a fresh store: **39 min, 46.1 GB peak RAM**, 345M unique nodes. Every ledger's
   `account_hash`, transaction hashes and parent-chained `LedgerHash` are recomputed and checked.
 - **Cold start:** a node wiped and reseeded from the archive caught up to the network and served
