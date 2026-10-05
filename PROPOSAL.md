@@ -29,17 +29,10 @@ Full XRPL history can't be obtained, can't be verified in bulk, and costs a lot 
   average, flat for 90 days; about 90% is current-state traffic, and `account_tx` and `tx` together
   are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94% stay within
   the last ~5 days, and only ~5% reach back more than ~46 days. Current state is served from memory
-  (97.7% cache hit rate, ~12-13 GB per node), not from the database. The database mostly holds
-  history that few requests touch.
+  (97.7% cache hit rate, ~12-13 GB per node), not from the database.
 - **The store is slow to change.** It is filled by sequential ingest from a live rippled. We found no
   offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
   schema means re-ingesting history ledger by ledger; how long that takes is not measured.
-- **Copying the history into a node doesn't give you account history.** A node seeded from the
-  archive serves state and ledgers at once, but `account_tx` on the imported ledgers needs rows in
-  xrpld's `transaction.db` (`xrla-import --txdb` now writes them) and an unbroken run of ledgers
-  from the import to the live tip. A chunk is ~7 days of mainnet and ends days behind the tip, so
-  xrpld has to fetch the gap from peers. Measured: 13.5 h for a 71k-ledger gap (~100 ledgers/min
-  from 32 peers; disk and CPU idle), against ~4 min for a 763-ledger gap.
 - **The demand is real.** The anchor case: a market-making firm couldn't get what it needed from
   Clio's full-history mode and asked for a full-history xrpld node directly (CONTEXT.md).
 
