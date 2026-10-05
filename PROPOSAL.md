@@ -23,6 +23,11 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
   (observed). Disk is a hard ceiling on one machine. Anyone running one pays
   $10.848/hour on demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node.
   This is the instance only; data transfer and backups are not included.
+- **The data is lost when the instance stops.** The i3en's disks are local NVMe (instance store),
+  and their contents are lost when the instance is stopped or terminated, or when the underlying
+  host fails. Keeping the data safe means keeping a backup, which is not in the cost above. With no
+  backup, recovery is a full re-download or backfill of ~43 TB, which takes months. Every new
+  snapshot also means stopping the service (see above).
 - **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
   sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
   it, and nothing downstream, Clio included, can recover it.
