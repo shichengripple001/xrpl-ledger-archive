@@ -198,15 +198,17 @@ imports.
 
 ### Goal
 
-Serve the same API Clio serves, for all ledger ranges, from the archive, without the ScyllaDB tier.
-History is split into ranges (chunks), and each request goes to the server that holds its range.
+Serve the same API Clio serves, for all of history, from the archive, without the ScyllaDB tier.
+History is sharded by ledger range: each server holds some ranges (built from the chunks), and each
+request goes to the server that holds its range. (This is unrelated to xrpld's removed "history
+sharding".)
 
 Answering in Clio's JSON needs libxrpl, the library xrpld and Clio use to turn ledger data into
 JSON. So this is one of two choices (decision 3 below):
 
 1. **Modify Clio:** keep Clio's request handling and JSON, which already use libxrpl, and replace
    its storage with a backend that reads stores built from the chunks.
-2. **Implement a new service** on libxrpl that serves the ledger ranges directly.
+2. **Implement a new service** on libxrpl that serves the shards directly.
 
 Either way, the stores have to be built from the chunks first: an account index (built), a
 transaction store readable by position, a hash index, ledger headers, and a store of every state
@@ -305,7 +307,7 @@ the build is repeatable from S3 alone, and a replica can be rebuilt without anyo
    time makes every later rebuild read ~6 TB instead of ~40 TB, and shortens the freshness gap.
    Doing it after publishing means re-exporting. This is the one choice that cannot wait.
 2. **Hosting and who pays for egress** (S3, a zero-egress host, or BitTorrent-first).
-3. **Modify Clio, or implement a new service on libxrpl** to serve the ledger ranges.
+3. **Modify Clio, or implement a new service on libxrpl** to serve history sharded by ledger range.
 4. **Range nodes / verified proofs:** build or skip.
 5. **Who runs the full export**, and on which stopped full-history node.
 
