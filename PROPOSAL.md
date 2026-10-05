@@ -107,17 +107,35 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 
 ### What already works (measured)
 
-- **Export:** creating one chunk of 150,000 ledgers (about a week of history) from a full-history
-  node took 47 minutes. It needs up to 19.2 GB of memory. The chunk is 207.8 GB, or 93.6 GB
-  compressed. xrpld has to be stopped while its database files are read.
-- **Import:** loading that chunk into an empty xrpld node took 39 minutes and up to 46.1 GB of
+All of this was run on one real 150,000-ledger chunk (ledgers 107,147,192 to 107,297,191, about a
+week of history), except where a smaller chunk is named.
+
+**Making and loading chunks**
+- **Export:** creating the chunk from a full-history node took 47 minutes and up to 19.2 GB of
+  memory. The chunk is 207.8 GB, or 93.6 GB compressed. xrpld has to be stopped while its database
+  files are read.
+- **Import:** loading the chunk into an empty xrpld node took 39 minutes and up to 46.1 GB of
   memory. Every ledger is checked as it is imported: the state and transactions are recomputed and
   must match the ledger's hash, and each ledger must chain to the one before it.
-- **Cold start:** a node wiped and reseeded from the archive caught up to the network and served
-  data matching r.ripple.com. Sampled comparison: **10,000 ledgers, 1.24M transactions, 13.7M field
-  comparisons, zero mismatches** (earlier run: 1,650 ledgers, ~220k transactions, zero).
-- Both memory blowups found on the way (127 GB read side, 96 GB write side) are fixed, and import
-  memory now scales with unique-node count, not chunk length.
+- **A seeded node serves correct data.** A node wiped and reseeded from the archive caught up to
+  the network and served data matching r.ripple.com. We compared 10,000 ledgers and 1.24 million
+  transactions, with zero mismatches.
+- **A seeded node serves account history.** Importing with `--txdb` takes 47 minutes and adds a
+  38 GB `transaction.db`. Once xrpld had fetched the gap to the live tip, it answered `account_tx` on
+  the imported ledgers.
+- Two early memory problems are fixed, one while reading the database (127 GB) and one while writing
+  it (96 GB). Import memory now depends on the number of unique tree nodes, not the chunk's length.
+
+**Querying a chunk with the tool (no node)**
+- **Index:** building the account and transaction index for the chunk takes 14 minutes and produces
+  a 5.07 GB file.
+- **Verified against xrpld:** our rule for which accounts a transaction touched matched xrpld's own
+  records on about 3.9 million transactions. The tool's `account_tx` answers matched xrpld's
+  `account_tx` for 201 accounts (on a 5,000-ledger chunk).
+- **Verified against an independent server:** on the 150k chunk, the tool matched the imported
+  `transaction.db` for 66 accounts (14.3 million rows), and that table matched s2.ripple.com (Clio,
+  full history) for 10,000 random accounts (926,903 rows, same transactions in the same order) and
+  for the stored bytes of 10,000 random transactions. There were zero differences.
 
 ### What is left
 
