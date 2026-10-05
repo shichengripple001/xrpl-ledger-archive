@@ -14,7 +14,7 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 - **It is hard to distribute.** A full-history node holds **32 TB NuDB + 11 TB `transaction.db` +
   296 GB `ledger.db`** (observed, 2026-09-29). Someone who wants to run one has two options: get a
   copy from XRPL Commons and download the entire database, or backfill from peers with xrpld. Either
-  takes months (**estimate**, never measured end to end).
+  takes months.
 - **Every new snapshot starts from scratch.** There is no incremental way to publish history. To
   produce a new snapshot you stop the service, compress the whole database, split the compressed
   file, and upload all of it. The process is tedious and takes weeks.
