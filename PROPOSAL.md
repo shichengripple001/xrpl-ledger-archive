@@ -53,8 +53,9 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 - Let an operator fetch all of history or just a range, from any source, and verify every chunk
   against on-chain hashes without trusting where it came from.
-- Seed a working node from it in hours, not months (import is measured at 39 minutes per 150k chunk;
-  the whole archive is not measured).
+- Seed a working node from it in days, not months: download is hours on a fast link, and import is
+  measured at 39 minutes per recent 150k chunk, at most ~19 days for the whole archive (estimate,
+  see "Size and time").
 - Serve `account_tx` and `tx` for all history at roughly Clio's latency (observed 7-day mean:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
@@ -113,8 +114,17 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 | Archive, uncompressed | ~39–42 TB (floor of unique nodes + one ~10 GB checkpoint per chunk) |
 | Archive, compressed | ~18–19 TB (**estimate**: the 39–42 TB total divided by the 2.22× measured on one recent chunk, assuming older eras compress alike) |
 | One recent 150k chunk | 207.8 GB measured; **93.6 GB compressed, measured** (zstd level 3, 2.22×) |
-| Download of the whole archive | ~4–5 h at 10 Gbps, ~2 days at 1 Gbps |
+| Download of the whole archive (~19 TB) | **estimate**, assuming a full link: 100 Mbps ~17.6 days, 1 Gbps ~42 h, 10 Gbps ~4.2 h, 25 Gbps ~1.7 h. At the ~42 TB upper bound, 2.2× longer |
+| Download of one recent chunk (93.6 GB) | 100 Mbps ~2.1 h, 1 Gbps ~12.5 min, 10 Gbps ~1.25 min. The average chunk is ~27 GB (19 TB ÷ 715), so ~3.5× faster |
+| Import of one recent chunk | **39 min measured** (47 min with `--txdb`), 46 GB peak RAM |
+| Import of the whole archive (715 chunks) | **upper bound ~19 days** (715 × 39 min, one after another; ~23 days with `--txdb`). Older chunks are smaller and should be faster, but no old chunk has been imported, so by how much is not known. Download can overlap with import, so total time is roughly the import time |
 | S3 storage | ~19 TB (the 39–42 TB total divided by the measured 2.22×), ~$440/month. Upper bound if older eras do not compress: ~42 TB, ~$970/month. (**verify** pricing) |
+
+Several chunks can be imported in one run (`--chunk a b c`): they share one NuDB store and shared
+nodes are written once. They run one after another, not in parallel. Not yet verified on real data:
+memory across hundreds of chunks (it grows with unique nodes; 46 GB is for one), how `ledger.db`
+looks at chunk boundaries (the importer does not write a chunk's first ledger), and parallel
+imports.
 
 ### Limits to state up front
 
