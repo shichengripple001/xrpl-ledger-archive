@@ -59,11 +59,12 @@ Those are two separate problems, one per stage.
   no offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
   schema means re-ingesting history ledger by ledger; how long that takes is not measured.
 - **The archive alone doesn't replace it.** A node seeded from the archive serves state and ledgers
-  at once, but `account_tx` on the imported history fails (`lgrIdxsInvalid`) until xrpld has
-  rebuilt its own `transaction.db` rows for those ledgers, which it does newest-to-oldest at about
-  3-4 ledgers/s (measured over ~2 minutes on a node seeded from an empty database). That is ~12 h
-  for one 150k chunk and months for all history (estimate). And a chunk is ~7 days of mainnet, so
-  an archive alone is always up to a week behind the tip.
+  at once. `account_tx` on the imported history needs two things: rows in xrpld's `transaction.db`
+  (`xrla-import --txdb` now writes them, see below) and an unbroken run of ledgers from the import
+  to the live tip. A chunk is ~7 days of mainnet, so the chunk always ends days behind the tip and
+  xrpld has to fetch the gap from peers. Measured: 13.5 h for a 71k-ledger gap (~100 ledgers/min,
+  about 1.7/s, from 32 peers; disk and CPU idle), against ~4 min for a 763-ledger gap. Chunks that
+  end near the tip remove the wait.
 
 ### What a solution has to do
 
@@ -137,11 +138,18 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 
 ### Limits to state up front
 
-- A seeded node serves state and ledgers immediately, but `account_tx` on imported history only
-  works as fast as xrpld rebuilds its own `transaction.db` (~3-4 ledgers/s, measured). `xrla-import`
-  does not write `transaction.db`, so there is no way to skip that wait yet. The per-chunk index
-  (`xrla-index`) answers `account_tx` without a node; writing `transaction.db` at import time is
-  not built.
+- A seeded node serves state and ledgers immediately. `xrla-import --txdb` also writes xrpld's
+  `transaction.db` (Transactions + AccountTransactions) and each ledger's header object, so
+  `account_tx` works on imported history as soon as the imported range joins the live tip. Until
+  then xrpld returns `lgrIdxsInvalid`: the gap between the chunk's end and the tip is fetched from
+  peers (13.5 h for a 71k-ledger gap, measured). Import cost for a 150k chunk: 47 min with
+  `--txdb` against 39 min without, 38 GB `transaction.db`, 46 GB peak memory.
+- Measured per 150k chunk: 17,512,432 transactions, 34,997,796 account rows (2.0 per transaction),
+  index build 13:52 and 5.07 GB (SQLite, unpacked).
+- Verified on the 150k chunk against s2.ripple.com (Clio, full history): `account_tx` lists for
+  10,000 random accounts (926,903 rows, same hashes, same order) and the stored transaction and
+  metadata bytes of 10,000 random transactions, 0 differences. On the 5k chunk the import's rows
+  matched xrpld's own rows exactly (275,510 transactions, 527,613 account rows).
 - Import memory grows with the number of unique nodes imported (46 GB for one 150k chunk). How it
   scales to a many-chunk, full-history import is not measured. The export source must also be
   stopped while it is read.

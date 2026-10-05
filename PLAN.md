@@ -779,7 +779,11 @@ vs. range index) in Phase 1 alongside checkpoint spacing.
     discarding any partially-written chunk. Bounds lost work on a mid-export crash/interruption
     to one chunk's delta-replay cost, not a repeat of the full trie walk. Not started.
 
-13. **`account_tx` decoder + index (2026-07-09; decoder ✅ 2026-07-28, index ⬜)**. See Phase 4
+13. **`account_tx` decoder + index (2026-07-09; decoder ✅, index ✅, `--txdb` import ✅ 2026-10-03)**.
+    **Update 2026-10:** the decoder below was rewritten to follow xrpld's exact affected-accounts
+    rule (field-name driven, not type driven; the type-driven version dropped accounts on 48% of
+    transactions). Per-chunk index: `xrla-index`. `xrla-import --txdb` writes xrpld's
+    `transaction.db`. See PROPOSAL.md "Limits to state up front" for measurements and verification. See Phase 4
     "Two distinct query shapes" above for the full architecture and reasoning.
 
     ✅ **Decoder done** — `xrla-common/src/meta_decode.rs`. A generic decoder for xrpld's
