@@ -149,7 +149,7 @@ the full history or on older eras. The whole-archive numbers are estimates, in "
 |---|---|
 | **Export the whole history** | The long pole. At the measured ~53 ledgers/s, 107M ledgers is ~23 days in one process (**estimate**, upper bound: early history is far sparser, and separate ranges can run in parallel, each paying one checkpoint walk). Needs a stopped full-history node as the source. |
 | **Publisher** | A tool that writes `manifest.json` (chunk range, `chunk_hash`, size, URL, torrent info-hash) and one torrent per chunk. Not built. |
-| **Hosting** | S3 (or equivalent) as the always-on source and web seed. See egress below. |
+| **Hosting** | S3 (or equivalent) as the always-on source, plus BitTorrent so downloaders and mirrors share the load, with S3 as a web seed. One torrent per chunk. See "Distribution" for egress. |
 | **Freeze the format** | `spec/chunk-format.md` is still DRAFT. Publishing freezes it, and changing it later means re-exporting everything. See the first decision below. |
 | **Measure compression** | Done for the recent era: the 207.8 GB chunk compresses to **93.6 GB (2.22×)** with zstd level 3. Older eras are not measured. |
 | **Operator guide** | Download, verify, import, catch up, with the failure modes we hit. |
