@@ -53,7 +53,7 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 ### What a solution has to do
 
-It has to work three ways, because people use history three ways.
+It has to support three ways of using the archive.
 
 **1. Download chunks and query them directly** (no node, any subset of chunks)
 - Fetch all of history or just a range, from S3 or BitTorrent, and verify every chunk against
