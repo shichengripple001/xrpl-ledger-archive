@@ -198,7 +198,19 @@ imports.
 
 ### Goal
 
-Serve the same API Clio serves, from the archive, without the ScyllaDB tier.
+Serve the same API Clio serves, for all ledger ranges, from the archive, without the ScyllaDB tier.
+History is split into ranges (chunks), and each request goes to the server that holds its range.
+
+Answering in Clio's JSON needs libxrpl, the library xrpld and Clio use to turn ledger data into
+JSON. So this is one of two choices (decision 3 below):
+
+1. **Modify Clio:** keep Clio's request handling and JSON, which already use libxrpl, and replace
+   its storage with a backend that reads stores built from the chunks.
+2. **Implement a new service** on libxrpl that serves the ledger ranges directly.
+
+Either way, the stores have to be built from the chunks first: an account index (built), a
+transaction store readable by position, a hash index, ledger headers, and a store of every state
+object's versions for queries at old ledgers (the largest piece, not built).
 
 ### What traffic actually looks like (observed, Clio dashboard, 7 days)
 
@@ -293,7 +305,7 @@ the build is repeatable from S3 alone, and a replica can be rebuilt without anyo
    time makes every later rebuild read ~6 TB instead of ~40 TB, and shortens the freshness gap.
    Doing it after publishing means re-exporting. This is the one choice that cannot wait.
 2. **Hosting and who pays for egress** (S3, a zero-egress host, or BitTorrent-first).
-3. **Reuse Clio's server code, or write our own** handlers in Rust.
+3. **Modify Clio, or implement a new service on libxrpl** to serve the ledger ranges.
 4. **Range nodes / verified proofs:** build or skip.
 5. **Who runs the full export**, and on which stopped full-history node.
 
