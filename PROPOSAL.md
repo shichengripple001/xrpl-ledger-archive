@@ -9,46 +9,79 @@ real node), or **estimate** (arithmetic, not yet confirmed). Estimates are liste
 
 ## The problem
 
-Full XRPL history can't be obtained, can't be verified in bulk, and costs a lot to serve.
+Full XRPL history is hard to distribute, hard to keep current, and expensive to run and serve.
 
-- **It is huge and slow to copy.** A full-history node is **32 TB NuDB + 11 TB `transaction.db` +
-  296 GB `ledger.db`** (observed, 2026-09-29), growing ~12 GB/day. The only route is P2P backfill.
-  On a real node only 3 of 16 peers held deep history, and the rate degrades past ~20k ledgers deep
-  (both measured). A full backfill takes months (**estimate**, never measured end to end).
-- **Most nodes don't have it to give.** Most run `online_delete` with a rolling window (our own
-  sensor node keeps 256 ledgers, about 17 minutes). A node that never held the history can't supply
-  it, and nothing downstream, Clio included, can recover it.
-- **It can't be handed over in pieces.** Operators can't share history or take just a range; it is
-  all or nothing. History sharding, the official attempt, was removed in xrpld 2.3.0 because every
-  shard duplicated unchanged tree nodes.
-- **There is no verified, bulk form.** Clio returns database rows, with no way to prove they belong
-  to a ledger's state without trusting the database and the pipeline that wrote it. Its API is
-  point queries, so a historical time series is N round trips.
-- **Serving it is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet and
-  mainnet**. The mainnet-only figure is not known. Observed on mainnet Clio over 7 days: ~1,760 req/s
-  average, flat for 90 days; about 90% is current-state traffic, and `account_tx` and `tx` together
-  are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94% stay within
-  the last ~5 days, and only ~5% reach back more than ~46 days. Current state is served from memory
-  (97.7% cache hit rate, ~12-13 GB per node), not from the database.
-- **The store is slow to change.** It is filled by sequential ingest from a live rippled. We found no
-  offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
-  schema means re-ingesting history ledger by ledger; how long that takes is not measured.
-- **The demand is real.** The anchor case: a market-making firm couldn't get what it needed from
-  Clio's full-history mode and asked for a full-history xrpld node directly (CONTEXT.md).
+### Getting full history
 
-### What a solution has to do
+- **It is hard to distribute.** A full-history node holds **32 TB NuDB + 11 TB `transaction.db` +
+  296 GB `ledger.db`** (observed, 2026-09-29). Someone who wants to run one has two options: get a
+  copy from XRPL Commons and download the entire database, or backfill from peers with xrpld. Either
+  takes months.
+- **Every new snapshot starts from scratch.** There is no incremental way to publish history. To
+  produce a new snapshot you stop the service, compress the whole database, split the compressed
+  file, and upload all of it. The process is tedious and takes weeks.
+- **Clio's data can't be cheaply checked.** Clio returns rows with no proof attached. You can check
+  them against a ledger's hash, but only by refetching the whole ledger (every transaction, or the
+  entire state) and rebuilding its tree, one full fetch per ledger. At full-history scale that does
+  not work through a public API (not measured).
 
-- Let an operator fetch all of history or just a range, from any source, and verify every chunk
-  against on-chain hashes without trusting where it came from.
-- Seed a working node from it in hours, not months (import is measured at 39 minutes per 150k chunk;
-  the whole archive is not measured).
+### Running a full-history node
+
+- **It is expensive.** We run it on an i3en.24xlarge. Anyone running one pays $10.848/hour on
+  demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node. This is the instance only;
+  data transfer and backups are not included. One node can serve only very limited traffic, so
+  serving real load means paying that per node, many times over.
+- **It can't grow forever.** The i3en.24xlarge has 60 TB of local NVMe. The node already uses
+  ~43 TB and grows ~12 GB/day (observed). Disk is a hard ceiling on one machine.
+- **The data is lost when the instance stops.** The disks are local NVMe (instance store), and
+  their contents are lost when the instance is stopped or terminated, or when the underlying host
+  fails. Keeping the data safe means keeping a backup, which is not in the cost above. With no
+  backup, recovery is a full re-download or backfill of ~43 TB, which takes months.
+
+### Serving it through Clio
+
+- **The database tier is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet
+  and mainnet**. The mainnet-only figure is not known.
+- **The database is hard to operate.** Clio needs a Cassandra-compatible database (ScyllaDB), and
+  managing one is difficult for node operators.
+- **Its database is as hard to hand over as xrpld's, or harder.** To share it you export the
+  database and audit its integrity, and the recipient imports it and audits again. Apart from
+  hosting ScyllaDB yourself, there is no practical way to get the data.
+- **Rebuilding it means re-ingesting everything.** Clio fills its database by ingesting ledgers one
+  at a time from a live rippled. After a data loss, a bug fix or a schema change, the history is
+  ingested again from the start.
+
+### What we want the solution to do
+
+We are building a hash-verified archive of XRPL history, cut into chunks, with three ways to use
+it: query a chunk directly, seed your own xrpld node, or call our API.
+
+**1. Download chunks and query them directly** (no node, any subset of chunks)
+- Fetch all of history or just a range, from S3 or BitTorrent, and verify every chunk against
+  on-chain hashes without trusting where it came from.
+- Look up an account's transactions (`account_tx`) and a transaction by hash straight from the
+  downloaded chunk, using an index published with it, without running xrpld.
+- Prove the index is right: it records which chunk and which version of the account rule built it,
+  and can be rebuilt and checked.
+- Never silently drop a transaction from an account's history.
+
+**2. Download chunks and spin up an xrpld node**
+- Seed a working node in days, not months: download is hours on a fast link, and import is measured
+  at 39 minutes per recent 150k chunk, at most ~19 days for the whole archive (estimate, see "Size
+  and time").
+- The seeded node answers `account_tx` and `tx` on the imported ledgers (`xrla-import --txdb`), once
+  its imported range joins the live tip.
+- Publishing a new snapshot adds a chunk instead of re-uploading the whole database, and the chunks
+  in storage are the backup: a lost node is rebuilt from them, not re-downloaded for months.
+
+**3. Query our API directly**
 - Serve `account_tx` and `tx` for all history at roughly Clio's latency (observed 7-day mean:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
   forwarding writes.
 - Include the newest ledgers through a live tail, not only sealed chunks.
 - Rebuild from the archive in parallel, and lose a server without a long re-ingest.
-- Never silently drop a transaction from an account's history.
+- Replace Clio's ScyllaDB tier, so there is no Cassandra-compatible database to run.
 
 ## Stage 1 — Archive service
 
@@ -100,8 +133,17 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 | Archive, uncompressed | ~39–42 TB (floor of unique nodes + one ~10 GB checkpoint per chunk) |
 | Archive, compressed | ~18–19 TB (**estimate**: the 39–42 TB total divided by the 2.22× measured on one recent chunk, assuming older eras compress alike) |
 | One recent 150k chunk | 207.8 GB measured; **93.6 GB compressed, measured** (zstd level 3, 2.22×) |
-| Download of the whole archive | ~4–5 h at 10 Gbps, ~2 days at 1 Gbps |
+| Download of the whole archive (~19 TB) | **estimate**, assuming a full link: 100 Mbps ~17.6 days, 1 Gbps ~42 h, 10 Gbps ~4.2 h, 25 Gbps ~1.7 h. At the ~42 TB upper bound, 2.2× longer |
+| Download of one recent chunk (93.6 GB) | 100 Mbps ~2.1 h, 1 Gbps ~12.5 min, 10 Gbps ~1.25 min. The average chunk is ~27 GB (19 TB ÷ 715), so ~3.5× faster |
+| Import of one recent chunk | **39 min measured** (47 min with `--txdb`), 46 GB peak RAM |
+| Import of the whole archive (715 chunks) | **upper bound ~19 days** (715 × 39 min, one after another; ~23 days with `--txdb`). Older chunks are smaller and should be faster, but no old chunk has been imported, so by how much is not known. Download can overlap with import, so total time is roughly the import time |
 | S3 storage | ~19 TB (the 39–42 TB total divided by the measured 2.22×), ~$440/month. Upper bound if older eras do not compress: ~42 TB, ~$970/month. (**verify** pricing) |
+
+Several chunks can be imported in one run (`--chunk a b c`): they share one NuDB store and shared
+nodes are written once. They run one after another, not in parallel. Not yet verified on real data:
+memory across hundreds of chunks (it grows with unique nodes; 46 GB is for one), how `ledger.db`
+looks at chunk boundaries (the importer does not write a chunk's first ledger), and parallel
+imports.
 
 ### Limits to state up front
 
