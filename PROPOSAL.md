@@ -213,28 +213,32 @@ sharding".)
   per node). That is why one Clio node handles ~350 req/s. xrpld cannot, so xrpld does not serve
   this traffic.
 
-### Approach: modify Clio
+### Two ways to build it (decision 3)
 
 Answering in Clio's JSON needs libxrpl, the library xrpld and Clio use to turn ledger data into
-JSON. That leaves two choices: modify Clio, whose request handling already uses libxrpl, or
-implement a new service on libxrpl. We propose modifying Clio, because its design already fits
-sharding. Checked in the Clio 2.8.0 source, the version production runs:
+JSON. Either option uses it; they differ in how much existing code we take on. Neither has been
+tried or estimated.
 
-- Each Clio instance serves exactly one ledger range (lowest and highest ledger) and rejects
-  ledgers outside it, so one instance per shard fits.
+**What Clio looks like** (from the Clio 2.8.0 source, the version production runs):
+- Each Clio instance serves exactly one ledger range and rejects ledgers outside it.
 - Every request it answers is either about one ledger, or walks ledgers in order (`account_tx`,
   `nft_history`).
-- It reads all data through one storage interface (41 functions, about 22 of them reads). We
-  write a backend for that interface that reads our stores. Request handling and JSON are
-  untouched, so we write no libxrpl code.
+- It reads all data through one storage interface: 41 functions, about 22 of them reads.
 - It answers 37 methods itself and forwards 13 to rippled (`submit`, `fee`, `ledger_current`, path
-  finding and others), as it does today.
+  finding and others).
+
+| | Modify Clio | New service on libxrpl |
+|---|---|---|
+| What we write | A storage backend for Clio's interface, reading our stores | Request handling for the methods we serve, using libxrpl for JSON |
+| What we get for free | Clio's request handling, JSON output, caching, forwarding | Nothing beyond libxrpl |
+| Risks | Clio is built around a live database filled by its own ETL; serving a fixed old range with no live feed is not checked (see below). We must keep up with changes to Clio's internal interface. C++ code on top of our Rust stores | Re-implementing 37 methods and their behaviour across amendments, and matching Clio's responses exactly |
+| Fit with sharding | Its one-range-per-instance design fits, but it was not built for it | Designed for it from the start |
 
 ### Design
 
 | Part | What it does |
 |---|---|
-| **Shard** | One Clio instance with our backend, serving one ledger range from stores built from that range's chunks. Run with replicas. |
+| **Shard** | A server (a modified Clio or the new service) serving one ledger range from stores built from that range's chunks. Run with replicas. |
 | **Newest shard** | Serves the latest ledgers and current state, fed live from xrpld as Clio is today. When a chunk is sealed, its range moves to a sealed shard. How it stores the not-yet-sealed ledgers is not decided. |
 | **Router** | Sends each request to the shard holding its ledger. Walks `account_tx` across shards, newest first, until the limit is filled. Finds `tx` by hash through one global hash-to-ledger index (a `ctid` already contains the ledger, so needs none). |
 | **xrpld** | Feeds new ledgers and answers the forwarded methods. |
@@ -256,9 +260,9 @@ change after it, so a shard needs no data from other shards.
 
 ### Open question that could change the approach
 
-Whether a Clio instance can serve a fixed old range with no live rippled feed. Clio has a strict
-read-only mode, but it refuses to start on an empty database and is built to follow a writer. Not
-checked yet. If it cannot, old-range shards need a change inside Clio, or the new-service option.
+If we modify Clio: whether a Clio instance can serve a fixed old range with no live rippled feed.
+Clio has a strict read-only mode, but it refuses to start on an empty database and is built to
+follow a writer. Not checked yet. If it cannot, modifying Clio means changing more than its storage.
 
 ### Cost
 
@@ -298,8 +302,8 @@ hand-holding it.
    time makes every later rebuild read ~6 TB instead of ~40 TB, and shortens the freshness gap.
    Doing it after publishing means re-exporting. This is the one choice that cannot wait.
 2. **Hosting and who pays for egress** (S3, a zero-egress host, or BitTorrent-first).
-3. **Modify Clio (proposed), or implement a new service on libxrpl**, to serve history sharded by
-   ledger range.
+3. **Modify Clio, or implement a new service on libxrpl**, to serve history sharded by ledger
+   range. See "Two ways to build it".
 4. **Verified state proofs:** build or skip.
 5. **Who runs the full export**, and on which stopped full-history node.
 
