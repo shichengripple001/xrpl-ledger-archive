@@ -53,18 +53,34 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 ### What a solution has to do
 
-- Let an operator fetch all of history or just a range, from any source, and verify every chunk
-  against on-chain hashes without trusting where it came from.
-- Seed a working node from it in days, not months: download is hours on a fast link, and import is
-  measured at 39 minutes per recent 150k chunk, at most ~19 days for the whole archive (estimate,
-  see "Size and time").
+It has to work three ways, because people use history three ways.
+
+**1. Download chunks and query them directly** (no node, any subset of chunks)
+- Fetch all of history or just a range, from S3 or BitTorrent, and verify every chunk against
+  on-chain hashes without trusting where it came from.
+- Look up an account's transactions (`account_tx`) and a transaction by hash straight from the
+  downloaded chunk, using an index published with it, without running xrpld.
+- Prove the index is right: it records which chunk and which version of the account rule built it,
+  and can be rebuilt and checked.
+- Never silently drop a transaction from an account's history.
+
+**2. Download chunks and spin up an xrpld node**
+- Seed a working node in days, not months: download is hours on a fast link, and import is measured
+  at 39 minutes per recent 150k chunk, at most ~19 days for the whole archive (estimate, see "Size
+  and time").
+- The seeded node answers `account_tx` and `tx` on the imported ledgers (`xrla-import --txdb`), once
+  its imported range joins the live tip.
+- Publishing a new snapshot adds a chunk instead of re-uploading the whole database, and the chunks
+  in storage are the backup: a lost node is rebuilt from them, not re-downloaded for months.
+
+**3. Query our API directly**
 - Serve `account_tx` and `tx` for all history at roughly Clio's latency (observed 7-day mean:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
   forwarding writes.
 - Include the newest ledgers through a live tail, not only sealed chunks.
 - Rebuild from the archive in parallel, and lose a server without a long re-ingest.
-- Never silently drop a transaction from an account's history.
+- Replace Clio's ScyllaDB tier, so there is no Cassandra-compatible database to run.
 
 ## Stage 1 — Archive service
 
