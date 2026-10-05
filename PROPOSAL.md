@@ -107,13 +107,12 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 
 ### What already works (measured)
 
-- **Export** creates a chunk from a full-history node's database files, and xrpld has to be stopped
-  while it reads them. We exported one real chunk of 150,000 ledgers (107,147,192 to 107,297,191):
-  **47 minutes, up to 19.2 GB of memory, a 207.8 GB file**.
-- **Import** of that same 150,000-ledger chunk into an empty xrpld database: **39 minutes, up to
-  46.1 GB of memory**, 345 million tree nodes written. Every ledger is checked as it is imported:
-  the state and transactions are recomputed and must match the ledger's hash, and each ledger must
-  chain to the one before it.
+- **Export:** creating one chunk of 150,000 ledgers (about a week of history) from a full-history
+  node took 47 minutes. It needs up to 19.2 GB of memory. The chunk is 207.8 GB, or 93.6 GB
+  compressed. xrpld has to be stopped while its database files are read.
+- **Import:** loading that chunk into an empty xrpld node took 39 minutes and up to 46.1 GB of
+  memory. Every ledger is checked as it is imported: the state and transactions are recomputed and
+  must match the ledger's hash, and each ledger must chain to the one before it.
 - **Cold start:** a node wiped and reseeded from the archive caught up to the network and served
   data matching r.ripple.com. Sampled comparison: **10,000 ledgers, 1.24M transactions, 13.7M field
   comparisons, zero mismatches** (earlier run: 1,650 ledgers, ~220k transactions, zero).
