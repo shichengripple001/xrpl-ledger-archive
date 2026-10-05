@@ -51,9 +51,9 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
   at a time from a live rippled. After a data loss, a bug fix or a schema change, the history is
   ingested again from the start.
 
-### What a solution has to do
+### What we want the solution to do
 
-It has to support three ways of using the archive.
+We want the archive to be usable three ways.
 
 **1. Download chunks and query them directly** (no node, any subset of chunks)
 - Fetch all of history or just a range, from S3 or BitTorrent, and verify every chunk against
