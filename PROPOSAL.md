@@ -83,7 +83,7 @@ three ways:
 - Publishing a new snapshot adds a chunk instead of re-uploading the whole database, and the chunks
   in storage are the backup: a lost node is rebuilt from them, not re-downloaded for months.
 
-**3. Query our API directly**
+**3. A query layer built on top** (planned, not built)
 - Serve `account_tx` and `tx` for all history at roughly Clio's latency (observed 7-day mean:
   `account_tx` 21 ms, `tx` 3 ms) at ~165 req/s with headroom.
 - Serve current state from memory at Clio's volume, with xrpld only feeding ledgers in and
