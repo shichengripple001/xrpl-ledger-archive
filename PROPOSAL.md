@@ -53,8 +53,14 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 ### What we want the solution to do
 
-We are building a hash-verified archive of XRPL history, cut into chunks, with three ways to use
-it: query a chunk directly, seed your own xrpld node, or call our API.
+We are building a hash-verified archive of XRPL history, cut into chunks. The data can be served
+three ways:
+
+1. **Query with the tool.** Look up account history and transactions straight from a downloaded
+   chunk, with no node.
+2. **Bootstrap an xrpld node.** Import a recent range or the full history (all ranges), and the
+   node serves it to the network over P2P.
+3. **A query layer built on top.** An API that serves the archive, like Clio but without ScyllaDB.
 
 **1. Download chunks and query them directly** (no node, any subset of chunks)
 - Fetch all of history or just a range, from S3 or BitTorrent, and verify every chunk against
