@@ -194,12 +194,6 @@ imports.
   tree nodes (46 GB for one chunk); the figure for the whole history is unknown.
 - **Export needs the source node stopped** while its database files are read.
 
-### Done when
-
-The full range is published with a manifest and torrents; a fresh machine can pull it and reach
-`full` on mainnet; and a sampled comparison against independent real xrpld nodes shows zero
-mismatches.
-
 ## Stage 2 — Query layer
 
 ### Goal
