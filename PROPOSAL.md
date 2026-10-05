@@ -220,7 +220,9 @@ JSON. Either option uses it; they differ in how much existing code we take on. N
 tried or estimated.
 
 **What Clio looks like** (from the Clio 2.8.0 source, the version production runs):
-- Each Clio instance serves exactly one ledger range and rejects ledgers outside it.
+- Each Clio instance keeps one record of which ledgers it holds: a single range, from its lowest to
+  its highest ledger. A request for a ledger newer than its highest is refused ("ledger not
+  found"). What happens below its lowest is not checked.
 - Every request it answers is either about one ledger, or walks ledgers in order (`account_tx`,
   `nft_history`).
 - It reads all data through one storage interface: 41 functions, about 22 of them reads.
