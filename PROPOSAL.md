@@ -129,8 +129,12 @@ the full history or on older eras. The whole-archive numbers are estimates, in "
   about 71,000 ledgers), it answered `account_tx` on the imported ledgers.
 
 **Querying the chunk with the tool (no node)**
-- **Index:** building the account and transaction index for the chunk took 14 minutes and produced
-  a 5.07 GB file.
+- **Index:** reading a 207.8 GB chunk for every question would be far too slow, so the tool first
+  builds a lookup file from the chunk, once. It reads every transaction and records which accounts
+  it touched and where it sits in the chunk (its ledger and its position in that ledger). For this
+  chunk that is 17.5 million transactions and 35 million account entries. It took 14 minutes and
+  produced a 5.07 GB file. After that, finding an account's transactions, or one transaction by its
+  hash, is a lookup in that file and does not touch the chunk.
 - **Checked against xrpld:** our rule for which accounts a transaction touched matched xrpld's own
   records on about 3.9 million transactions from several ledger ranges. The tool's `account_tx`
   answers matched xrpld's `account_tx` for 201 accounts, on a 5,000-ledger chunk.
