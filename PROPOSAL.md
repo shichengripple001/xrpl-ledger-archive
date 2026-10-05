@@ -194,7 +194,7 @@ imports.
   tree nodes (46 GB for one chunk); the figure for the whole history is unknown.
 - **Export needs the source node stopped** while its database files are read.
 
-## Stage 2 — Query layer
+## Stage 2 — Query layer PoC
 
 ### Goal
 
