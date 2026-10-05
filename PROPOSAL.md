@@ -47,7 +47,7 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
   hosting ScyllaDB yourself, there is no practical way to get the data.
 - **Rebuilding it means re-ingesting everything.** Clio fills its database by ingesting ledgers one
   at a time from a live rippled. After a data loss, a bug fix or a schema change, the history is
-  ingested again from the start. How long that takes is not measured.
+  ingested again from the start.
 
 ### What a solution has to do
 
