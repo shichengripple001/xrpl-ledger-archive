@@ -20,8 +20,10 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 - **Every new snapshot starts from scratch.** There is no incremental way to publish history. To
   produce a new snapshot you stop the service, compress the whole database, split the compressed
   file, and upload all of it. The process is tedious and takes weeks.
-- **There is no verified form.** Clio returns database rows, with no way to prove they belong to a
-  ledger's state without trusting the database and the pipeline that wrote it.
+- **Clio's data can't be cheaply checked.** Clio returns rows with no proof attached. You can check
+  them against a ledger's hash, but only by refetching the whole ledger (every transaction, or the
+  entire state) and rebuilding its tree, one full fetch per ledger. At full-history scale that does
+  not work through a public API (not measured).
 
 ### Running a full-history node
 
