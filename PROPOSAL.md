@@ -29,7 +29,8 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 - **It is expensive.** We run it on an i3en.24xlarge. Anyone running one pays $10.848/hour on
   demand (us-west-2, AWS price list): ~$7.9k/month, ~$95k/year per node. This is the instance only;
-  data transfer and backups are not included.
+  data transfer and backups are not included. One node can serve only very limited traffic, so
+  serving real load means paying that per node, many times over.
 - **It can't grow forever.** The i3en.24xlarge has 60 TB of local NVMe. The node already uses
   ~43 TB and grows ~12 GB/day (observed). Disk is a hard ceiling on one machine.
 - **The data is lost when the instance stops.** The disks are local NVMe (instance store), and
