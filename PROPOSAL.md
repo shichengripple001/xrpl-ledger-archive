@@ -203,17 +203,6 @@ History is sharded by ledger range: each server holds some ranges (built from th
 request goes to the server that holds its range. (This is unrelated to xrpld's removed "history
 sharding".)
 
-Answering in Clio's JSON needs libxrpl, the library xrpld and Clio use to turn ledger data into
-JSON. So this is one of two choices (decision 3 below):
-
-1. **Modify Clio:** keep Clio's request handling and JSON, which already use libxrpl, and replace
-   its storage with a backend that reads stores built from the chunks.
-2. **Implement a new service** on libxrpl that serves the shards directly.
-
-Either way, the stores have to be built from the chunks first: an account index (built), a
-transaction store readable by position, a hash index, ledger headers, and a store of every state
-object's versions for queries at old ledgers (the largest piece, not built).
-
 ### What traffic actually looks like (observed, Clio dashboard, 7 days)
 
 - **~1,760 requests/s average, ~2,070 peak**, flat for 90 days, on 5 read nodes (~350 req/s each).
@@ -224,82 +213,84 @@ object's versions for queries at old ledgers (the largest piece, not built).
   per node). That is why one Clio node handles ~350 req/s. xrpld cannot, so xrpld does not serve
   this traffic.
 
+### Approach: modify Clio
+
+Answering in Clio's JSON needs libxrpl, the library xrpld and Clio use to turn ledger data into
+JSON. That leaves two choices: modify Clio, whose request handling already uses libxrpl, or
+implement a new service on libxrpl. We propose modifying Clio, because its design already fits
+sharding. Checked in the Clio 2.8.0 source, the version production runs:
+
+- Each Clio instance serves exactly one ledger range (lowest and highest ledger) and rejects
+  ledgers outside it, so one instance per shard fits.
+- Every request it answers is either about one ledger, or walks ledgers in order (`account_tx`,
+  `nft_history`).
+- It reads all data through one storage interface (41 functions, about 22 of them reads). We
+  write a backend for that interface that reads our stores. Request handling and JSON are
+  untouched, so we write no libxrpl code.
+- It answers 37 methods itself and forwards 13 to rippled (`submit`, `fee`, `ledger_current`, path
+  finding and others), as it does today.
+
 ### Design
 
-| Part | What it does | Sizing |
+| Part | What it does |
+|---|---|
+| **Shard** | One Clio instance with our backend, serving one ledger range from stores built from that range's chunks. Run with replicas. |
+| **Newest shard** | Serves the latest ledgers and current state, fed live from xrpld as Clio is today. When a chunk is sealed, its range moves to a sealed shard. How it stores the not-yet-sealed ledgers is not decided. |
+| **Router** | Sends each request to the shard holding its ledger. Walks `account_tx` across shards, newest first, until the limit is filled. Finds `tx` by hash through one global hash-to-ledger index (a `ctid` already contains the ledger, so needs none). |
+| **xrpld** | Feeds new ledgers and answers the forwarded methods. |
+
+### What each shard must hold
+
+All built from that range's chunks. A chunk holds the full state at its first ledger plus every
+change after it, so a shard needs no data from other shards.
+
+| Store | Used by | Status |
 |---|---|---|
-| **Current-state cache** | Latest state in memory, updated per validated ledger (~190 changed objects each). Serves `account_info`, `account_lines`, `book_offers`, `amm_info`, etc. | ~13 GB per node; ~6 nodes (**estimate**) |
-| **History service** | `account_tx`, `tx`, `ledger` for all history, from compressed per-ledger transaction blocks plus an account index and a hash index, on local NVMe. | ~3–4 TB (**estimate**); 3 × i4i.8xlarge across zones |
-| **Historical-state store** | Object versions per ledger, for state queries on old ledgers. | ~1.5–1.6 TB (**estimate**; the successor table part is unmeasured); fits on the history nodes |
-| **xrpld feeders** | Small xrpld nodes that feed validated ledgers in and forward `submit`, `fee`, `ledger_current`. | 2–3 small, ~100 req/s |
-| **Router** | Sends each request to the right part. Stateless. | 2 small |
+| Ledger headers | every request | in the chunks; needs a lookup table |
+| Every object's state at any ledger in the range | `account_info`, `account_lines`, `ledger_entry`, `amm_info` and most other methods | not built; the largest piece |
+| Successor index (the next key after a key, at a ledger) | `book_offers`, `ledger_data` | not built |
+| Each ledger's transactions and changes | `ledger`, `book_changes` | in the chunks; needs reading by position |
+| Account history | `account_tx` | built (`xrla-index`) and verified |
+| Transactions by hash | `tx` | built per chunk; the global index across shards is not built |
+| NFT and MPT indexes | `nft_info`, `nft_history`, `nfts_by_issuer`, `mpt_holders` | not built |
 
-Key choices:
+### Open question that could change the approach
 
-- **Reuse Clio's server code** by implementing its storage interface against our store, instead of
-  rewriting ~39 methods and their amendment handling. We would keep Clio's handlers, JSON and cache.
-  The cost is a C++ layer over our Rust code, and tracking changes to Clio's internal interface.
-- **Transaction bodies stored once, in ledger order**, so a transaction's Merkle path stays
-  verifiable. Indexes point at them.
-- **Built offline in parallel from verified chunks.** Chunks are independent, so a full rebuild is
-  hours of parallel work (**estimate**), where Clio's only path is sequential ingest. A decoder bug
-  or schema change means re-running the build, not re-ingesting for months.
-- **Live tail:** the newest ledgers are indexed from the feeders, so `account_tx` includes today,
-  and the tail hands over when the next chunk is built.
-- **Recovery:** local NVMe is lost on maintenance, so replicas re-download built indexes from S3
-  (~1 h, **estimate**). Three replicas allow rolling maintenance with redundancy.
+Whether a Clio instance can serve a fixed old range with no live rippled feed. Clio has a strict
+read-only mode, but it refuses to start on an empty database and is built to follow a writer. Not
+checked yet. If it cannot, old-range shards need a change inside Clio, or the new-service option.
 
-### Cost (**estimate**; AWS us-west-2 on-demand prices from memory, verify)
+### Cost
 
-New pieces for **mainnet**, replacing the ScyllaDB tier:
-
-| | On-demand | With the 50% savings plan |
-|---|---|---|
-| History service, 3 × i4i.8xlarge | ~$6.0k/month | ~$3.0k |
-| S3 (~20 TB archive + ~3.7 TB built indexes, ~$0.55k), monitoring and transfer (~$0.3k, **a guess**) | ~$0.85k | ~$0.85k (assumed not covered by the plan, **verify**) |
-| **Total** | **~$6.9k/month** | **~$3.9k/month (~$46k/year)** |
-
-If the archive does not compress at all (~42 TB), S3 adds about $0.5k/month to both columns.
-
-ScyllaDB today is **$232k/year across devnet, testnet and mainnet (~$19.3k/month). The
-mainnet-only figure is not known**, so the saving cannot be stated yet. The new pieces pay for
-themselves if mainnet ScyllaDB costs more than ~$3.9k/month (~$46k/year) with the savings plan, or
-~$6.9k/month without it. Illustrative only, since mainnet's share is a guess:
-
-| Mainnet share of the $232k | Mainnet ScyllaDB | Saving with the savings plan |
-|---|---|---|
-| 50% | ~$9.7k/month | ~$5.8k/month (~$70k/year) |
-| 75% | ~$14.5k/month | ~$10.7k/month (~$128k/year) |
-| 90% | ~$17.4k/month | ~$13.6k/month (~$163k/year) |
-
-Devnet and testnet stay on ScyllaDB unless the same stack also serves them. That is not costed.
-
-The current-state cache nodes replace today's Clio read nodes and the feeders replace the ETL
-nodes, so they are not new spend. **Not included:** engineering time (the largest cost), the
-overlap period when both systems run, and public download traffic.
+Not yet estimated for the sharded design. The earlier estimate assumed three servers each holding
+all history (3 × i4i.8xlarge, ~$6.9k/month on demand); sharding changes the server count and size,
+which depend on the store sizes above, none of which are measured. ScyllaDB today is **$232k/year
+across devnet, testnet and mainnet**; the mainnet-only share is not known, so the saving cannot be
+stated yet. **Not included:** engineering time (the largest cost) and the period when both systems
+run.
 
 ### Not covered at first
 
-- **Clio-only NFT methods** (~50 req/s) need a token index added to the same build.
-- **Verified state proofs** at old ledgers (the "hold a Merkle proof" product) need a full node
-  store, ~32 TB, roughly 10 servers with redundancy. This is optional, not needed for Clio parity.
+- **Verified state proofs** at old ledgers (a Merkle proof for any object) need a full node store,
+  ~32 TB. Optional; not needed to match Clio.
 - `subscribe` comes from xrpld; path finding and `submit` are forwarded, as Clio does today.
 
 ### How we prove it is right
 
-- **No silently missing transactions** is the central risk. The metadata decoder is proven not to
-  report wrong accounts, but never proven not to miss any. Checks: a transaction touching zero
-  accounts is a hard build error; every metadata blob is decoded with an independent
-  implementation and diffed in both directions; results are compared against real xrpld nodes
-  (r.ripple.com, xrplcluster.com), not Clio alone.
+- **Account history is already checked:** our rule for which accounts a transaction touched matched
+  xrpld on ~3.9 million transactions, and on the 150k chunk account histories matched s2.ripple.com
+  for 10,000 accounts and the stored bytes for 10,000 transactions, with zero differences.
+- **Each new store is checked the same way:** sampled requests compared with real xrpld nodes and
+  with Clio, reporting missing and extra results separately.
 - **Shadow traffic:** replay real Clio requests against the new stack and compare answers and
-  latency before any cutover. Target: no data mismatches, latency within Clio's today
-  (7-day mean: `account_tx` 21 ms, `tx` 3 ms; the dashboard has no true per-request p95).
+  latency before any cutover. Target: no data mismatches, latency within Clio's today (7-day mean:
+  `account_tx` 21 ms, `tx` 3 ms).
 
 ### Done when
 
 Shadow traffic matches production Clio on the sampled methods with latency at or below today's,
-the build is repeatable from S3 alone, and a replica can be rebuilt without anyone hand-holding it.
+the build is repeatable from S3 alone, and a shard can be rebuilt from its chunks without anyone
+hand-holding it.
 
 ## Decisions needed
 
@@ -307,14 +298,16 @@ the build is repeatable from S3 alone, and a replica can be rebuilt without anyo
    time makes every later rebuild read ~6 TB instead of ~40 TB, and shortens the freshness gap.
    Doing it after publishing means re-exporting. This is the one choice that cannot wait.
 2. **Hosting and who pays for egress** (S3, a zero-egress host, or BitTorrent-first).
-3. **Modify Clio, or implement a new service on libxrpl** to serve history sharded by ledger range.
-4. **Range nodes / verified proofs:** build or skip.
+3. **Modify Clio (proposed), or implement a new service on libxrpl**, to serve history sharded by
+   ledger range.
+4. **Verified state proofs:** build or skip.
 5. **Who runs the full export**, and on which stopped full-history node.
 
 ## Estimates still to be measured
 
 Compression on older eras (measured on one recent chunk only); total archive size; full-history export and import time; xrpld and
 cache node capacity (sets the node counts); transaction and index sizes (sampled on 13 points, so
-roughly ±30%); the historical-state store; per-method share of the ~5% of requests that reach
+roughly ±30%); size and build time of each shard's stores (state at any ledger, successor, NFT and MPT
+indexes); whether Clio can serve a fixed old range with no live feed; per-method share of the ~5% of requests that reach
 deeper than 1M ledgers; engineering effort for Stage 2; **mainnet-only ScyllaDB cost** (the
 $232k/year covers three networks), and whether the 50% savings plan covers S3 and the load balancer.
