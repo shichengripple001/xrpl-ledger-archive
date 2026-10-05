@@ -95,7 +95,6 @@ three ways:
   across servers by range and the service scales by adding servers.
 - If a server is lost or the index format changes, rebuild from the chunks, many at the same time,
   instead of re-ingesting ledger by ledger.
-- Replace Clio's ScyllaDB tier, so there is no Cassandra-compatible database to run.
 
 ## Stage 1 — Archive service
 
