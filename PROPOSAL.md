@@ -41,11 +41,6 @@ Full XRPL history is hard to distribute, hard to keep current, and expensive to 
 
 - **The database tier is expensive.** Clio's ScyllaDB tier is **~$232k/year across devnet, testnet
   and mainnet**. The mainnet-only figure is not known.
-- **The traffic doesn't match what the tier is for** (observed, mainnet Clio, 7 days): ~1,760 req/s
-  average, flat for 90 days. About 90% is current-state traffic, and `account_tx` and `tx` together
-  are ~165 req/s (~9%). Of ledger-scoped requests, ~89% ask for the newest ledger, ~94% stay within
-  the last ~5 days, and only ~5% reach back more than ~46 days. Current state is served from memory
-  (97.7% cache hit rate, ~12-13 GB per node), not from the database.
 - **It is slow to change.** The store is filled by sequential ingest from a live rippled. We found
   no offline bulk-load path in Clio's docs or source (read, not run). Fixing a bug or changing the
   schema means re-ingesting history ledger by ledger; how long that takes is not measured.
