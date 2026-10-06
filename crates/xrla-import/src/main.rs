@@ -232,16 +232,23 @@ fn check_tree_complete(what: &str, root: &Hash256, state: &HashMap<Hash256, Rc<S
     Ok(())
 }
 
-/// After applying a delta: each added inner node's children are present.
-fn check_added_children(seq: u32, added: &[SHAMapNode], state: &HashMap<Hash256, Rc<SHAMapNode>>) -> Result<()> {
+/// After applying a delta: each added inner node's children are present. `deleted` is the same
+/// delta's deletions, only used to say in the error whether the missing child was removed by it.
+fn check_added_children(
+    seq: u32,
+    added: &[SHAMapNode],
+    deleted: &[Hash256],
+    state: &HashMap<Hash256, Rc<SHAMapNode>>,
+) -> Result<()> {
     for node in added.iter().filter(|n| n.node_type.is_inner()) {
         let inner = InnerNode::from_node(node).map_err(|e| anyhow::anyhow!("{e}"))?;
         for child in inner.child_hashes() {
             if !state.contains_key(child) {
                 bail!(
-                    "ledger {seq}: added node {} points to child {} that is not present",
+                    "ledger {seq}: added node {} points to child {} that is not present{}",
                     hex::encode(node.hash),
-                    hex::encode(child)
+                    hex::encode(child),
+                    if deleted.contains(child) { " (it was removed by this same ledger's deletions)" } else { " (and this ledger did not delete it)" }
                 );
             }
         }
@@ -395,17 +402,25 @@ fn replay_chunk(
     let mut ledger_rows = Vec::new();
 
     for (i, delta) in chunk.deltas.iter().enumerate() {
+        // New state = (old state - deleted) + added. Removal has to come first: the diff compares
+        // tree positions, not hashes, so a node that moves up a level is listed as both deleted
+        // and added, and it belongs in the new state.
+        if verify {
+            for hash in &delta.diff.deleted {
+                if !state.contains_key(hash) {
+                    bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
+                }
+            }
+        }
+        for hash in &delta.diff.deleted {
+            state.remove(hash);
+        }
         for node in &delta.diff.added {
             state.insert(node.hash, Rc::new(node.clone()));
             sink_node(sink, node)?;
         }
-        for hash in &delta.diff.deleted {
-            if state.remove(hash).is_none() && verify {
-                bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
-            }
-        }
         if verify {
-            check_added_children(delta.ledger_seq, &delta.diff.added, &state)?;
+            check_added_children(delta.ledger_seq, &delta.diff.added, &delta.diff.deleted, &state)?;
         }
 
         let tx_map = chunk
@@ -594,17 +609,25 @@ fn replay_chunk_streaming(
     let mut ledger_rows = Vec::new();
 
     while let Some((delta, tx_map)) = reader.next_delta_tx_map()? {
+        // New state = (old state - deleted) + added. Removal has to come first: the diff compares
+        // tree positions, not hashes, so a node that moves up a level is listed as both deleted
+        // and added, and it belongs in the new state.
+        if verify {
+            for hash in &delta.diff.deleted {
+                if !state.contains_key(hash) {
+                    bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
+                }
+            }
+        }
+        for hash in &delta.diff.deleted {
+            state.remove(hash);
+        }
         for node in &delta.diff.added {
             state.insert(node.hash, Rc::new(node.clone()));
             sink_node(sink, node)?;
         }
-        for hash in &delta.diff.deleted {
-            if state.remove(hash).is_none() && verify {
-                bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
-            }
-        }
         if verify {
-            check_added_children(delta.ledger_seq, &delta.diff.added, &state)?;
+            check_added_children(delta.ledger_seq, &delta.diff.added, &delta.diff.deleted, &state)?;
         }
 
         if tx_map.ledger_seq != delta.ledger_seq {
