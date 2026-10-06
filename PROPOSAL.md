@@ -107,9 +107,10 @@ range produce the same bytes, and anyone can verify a chunk without trusting whe
 
 ### What already works (measured)
 
-**Scope.** Everything below was run on one chunk: 150,000 ledgers (107,147,192 to 107,297,191),
-about a week of history and about 0.14% of mainnet's ~107 million ledgers. Nothing has been run on
-the full history or on older eras. The whole-archive numbers are estimates, in "Size and time".
+**Scope.** Everything below was run on one main chunk of 150,000 ledgers (107,147,192 to
+107,297,191), about a week of history and about 0.14% of mainnet's ~107 million ledgers, plus
+smaller chunks (5,000 to 20,000 ledgers) where named. Nothing has been run on the full history or on
+older eras. The whole-archive numbers are estimates, in "Size and time".
 
 **Making and loading the chunk**
 - **Export:** exporting those 150,000 ledgers from a full-history node took 47 minutes and up to
@@ -128,6 +129,19 @@ the full history or on older eras. The whole-archive numbers are estimates, in "
   `transaction.db`. After xrpld fetched the gap between the chunk and the live tip (13.5 hours for
   about 71,000 ledgers), it answered `account_tx` on the imported ledgers.
 
+**Verifying a chunk without importing it**
+- `xrla-import --verify-only` checks a chunk completely and writes nothing: every node rehashes to
+  its own hash, the checkpoint tree is complete with nothing extra, every ledger's changes replay to
+  its stored state root, its transactions and ledger hash recompute, and the final tree is complete.
+  No xrpld and no database are needed.
+- It passed on the 150k chunk (38 minutes, 16 GB of memory), on a 20,000-ledger chunk (8 minutes),
+  and on three consecutive 5,000-ledger chunks exported in one run (9 minutes together, each
+  verified on its own, including the checkpoints of the second and third).
+- Running it found a bug in the order that a ledger's deletions and additions were applied, in both
+  the importer and the exporter. It is fixed, with a test.
+- Not yet checked: that one chunk's last ledger links to the next chunk's first, and that the final
+  ledger hash matches the live network.
+
 **Querying the chunk with the tool (no node)**
 - **Index:** reading a 207.8 GB chunk for every question would be far too slow, so the tool first
   builds a lookup file from the chunk, once. It reads every transaction and records which accounts
@@ -142,6 +156,14 @@ the full history or on older eras. The whole-archive numbers are estimates, in "
   `transaction.db` for 66 accounts (14.3 million rows). That table matched s2.ripple.com (Clio, full
   history) for 10,000 random accounts (926,903 rows, same transactions in the same order) and for
   the stored bytes of 10,000 random transactions. There were zero differences.
+- **The tool itself against s2:** on the 150k chunk, `xrla-index query` matched s2's `account_tx`
+  for 1,100 accounts in 3,300 cases (paged newest first, oldest first on a sub-range, and a limited
+  sub-range), with zero differences.
+- **Across two chunks:** scanning two consecutive 10,000-ledger chunks for 500 accounts and joining
+  the results matched s2 over the whole 20,000-ledger range (149,911 rows). 450 of the accounts have
+  transactions on both sides of the boundary.
+- **Ledger headers:** 56 sampled ledgers from those two chunks matched s2 on ledger hash, total
+  coins and transaction count.
 
 ### What is left
 
@@ -193,6 +215,9 @@ imports.
 - **Memory for a many-chunk import is not measured.** Import memory grows with the number of unique
   tree nodes (46 GB for one chunk); the figure for the whole history is unknown.
 - **Export needs the source node stopped** while its database files are read.
+- **Chunks are not yet checked against each other.** Each chunk is verified on its own. A chunk
+  does not store its first ledger's parent hash, so nothing confirms that consecutive chunks join.
+  Adding the parent hash to the chunk header, before anything is published, would allow it.
 
 ## Stage 2 — Query layer PoC
 
