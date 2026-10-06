@@ -17,7 +17,7 @@ use rusqlite::{Connection, params};
 
 use xrla_common::chunk::{chunk_filename, LedgerDelta, TxMap, NETWORK_MAINNET};
 use xrla_common::serialize::{calculate_ledger_hash, ChunkWriter, LedgerHashInput};
-use xrla_common::shamap::{Hash256, SHAMapNode};
+use xrla_common::shamap::{Hash256, SHAMapDiff, SHAMapNode};
 use xrla_nudb::NuDBReader;
 
 #[derive(Parser, Debug)]
@@ -189,12 +189,7 @@ fn main() -> Result<()> {
             let curr_info = &batch_infos[i];
             let curr_ledger_hash = batch_ledger_hashes[i];
 
-            for node in &diff.added {
-                state.insert(node.hash, node.clone());
-            }
-            for hash in &diff.deleted {
-                state.remove(hash);
-            }
+            apply_diff(&mut state, &diff);
 
             let txns = nudb
                 .collect_transactions(&curr_info.tx_hash)
@@ -397,4 +392,42 @@ fn parse_hash(s: &str) -> Result<Hash256> {
     let mut h = [0u8; 32];
     h.copy_from_slice(&bytes);
     Ok(h)
+}
+
+/// Apply one ledger's diff to the running state: new state = (old state - deleted) + added.
+///
+/// Removal has to come first. The diff compares tree positions, not hashes, so a node that moves
+/// up a level (for example a leaf whose sibling was deleted) is listed as both deleted and added,
+/// and it belongs in the new state. Adding first and then removing would drop it, and the next
+/// chunk's checkpoint, which is a snapshot of this map, would be missing a node the tree uses.
+fn apply_diff(state: &mut HashMap<Hash256, SHAMapNode>, diff: &SHAMapDiff) {
+    for hash in &diff.deleted {
+        state.remove(hash);
+    }
+    for node in &diff.added {
+        state.insert(node.hash, node.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xrla_common::shamap::NodeType;
+
+    fn node(tag: u8) -> SHAMapNode {
+        SHAMapNode { hash: [tag; 32], node_type: NodeType::AccountState, content: vec![tag; 4] }
+    }
+
+    #[test]
+    fn a_node_listed_as_both_deleted_and_added_stays_in_the_state() {
+        let mut state: HashMap<Hash256, SHAMapNode> =
+            [node(1), node(2), node(3)].into_iter().map(|n| (n.hash, n)).collect();
+        // Node 2 moves up a level: the diff lists it as deleted (old position) and added (new).
+        let diff = SHAMapDiff { added: vec![node(2), node(4)], deleted: vec![[2; 32], [3; 32]] };
+        apply_diff(&mut state, &diff);
+        assert!(state.contains_key(&[2; 32]), "a node the new tree still uses must survive");
+        assert!(state.contains_key(&[4; 32]), "added node present");
+        assert!(state.contains_key(&[1; 32]), "untouched node present");
+        assert!(!state.contains_key(&[3; 32]), "a node only deleted is gone");
+    }
 }

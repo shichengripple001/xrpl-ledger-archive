@@ -14,7 +14,9 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use xrla_common::chunk::TxRecord;
-use xrla_common::meta_decode::{account_id_to_classic_address, affected_accounts};
+use xrla_common::meta_decode::{
+    account_id_to_classic_address, affected_accounts, classic_address_to_account_id, summarize_meta,
+};
 use xrla_common::serialize::deserialize_chunk;
 
 #[derive(Parser, Debug)]
@@ -42,6 +44,12 @@ struct Args {
     /// existing meta_blob data, no separate index required
     #[arg(long)]
     account: Option<String>,
+
+    /// Like --account, for many accounts in one pass over the chunk: a file with one classic
+    /// r-address per line. Prints `account  ledger  txn_index  tx_hash` for each match, where
+    /// `txn_index` is the transaction's position in its ledger (xrpld's `TxnSeq`).
+    #[arg(long)]
+    accounts_file: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -53,7 +61,9 @@ fn main() -> Result<()> {
 
     let chunk = deserialize_chunk(&data).context("parsing chunk")?;
 
-    if let Some(account) = &args.account {
+    if let Some(path) = &args.accounts_file {
+        print_accounts_tx(&chunk, path)?;
+    } else if let Some(account) = &args.account {
         print_account_tx(&chunk, account)?;
     } else if let Some(hash_hex) = &args.tx_hash {
         print_tx_by_hash(&chunk, hash_hex)?;
@@ -198,6 +208,54 @@ fn print_account_tx(chunk: &xrla_common::chunk::Chunk, account_r_address: &str) 
     println!("{found} transaction(s) touched {account_r_address} in ledgers {}..={}", chunk.start_ledger, chunk.end_ledger);
     if undecodable > 0 {
         bail!("{undecodable} transaction(s) could not be decoded — the list above is INCOMPLETE");
+    }
+    Ok(())
+}
+
+/// Many-account scan in one pass: for every transaction, decode its metadata once and print a
+/// line for each wanted account it touched. A transaction that cannot be decoded fails the command
+/// at the end, so the output can never be mistaken for complete.
+fn print_accounts_tx(chunk: &xrla_common::chunk::Chunk, path: &std::path::Path) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut wanted: std::collections::HashSet<[u8; 20]> = std::collections::HashSet::new();
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        wanted.insert(
+            classic_address_to_account_id(line)
+                .with_context(|| format!("not a classic address: {line}"))?,
+        );
+    }
+    let mut lines = 0usize;
+    let mut undecodable = 0usize;
+    for tx_map in &chunk.tx_maps {
+        for tx in &tx_map.txns {
+            let summary = match summarize_meta(&tx.meta_blob) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("error: tx {} could not be decoded: {e}", hex::encode_upper(tx.tx_hash));
+                    undecodable += 1;
+                    continue;
+                }
+            };
+            for a in summary.affected_accounts.iter().filter(|a| wanted.contains(*a)) {
+                lines += 1;
+                println!(
+                    "{} {} {} {}",
+                    account_id_to_classic_address(a),
+                    tx_map.ledger_seq,
+                    summary.transaction_index.map_or("-".to_string(), |i| i.to_string()),
+                    hex::encode_upper(tx.tx_hash)
+                );
+            }
+        }
+    }
+    eprintln!(
+        "{lines} line(s) for {} account(s) in ledgers {}..={}",
+        wanted.len(),
+        chunk.start_ledger,
+        chunk.end_ledger
+    );
+    if undecodable > 0 {
+        bail!("{undecodable} transaction(s) could not be decoded — the output above is INCOMPLETE");
     }
     Ok(())
 }

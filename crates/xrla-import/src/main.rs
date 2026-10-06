@@ -22,7 +22,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use xrla_common::chunk::{Chunk, TxMap, FORMAT_VERSION_STREAMED};
@@ -45,9 +45,18 @@ struct Args {
     #[arg(long, required = true, num_args = 1..)]
     chunk: Vec<PathBuf>,
 
-    /// Path to the NuDB .dat file to write (a sibling .key file is written alongside it)
+    /// Path to the NuDB .dat file to write (a sibling .key file is written alongside it).
+    /// Required unless --verify-only.
     #[arg(long)]
-    dat: PathBuf,
+    dat: Option<PathBuf>,
+
+    /// Verify the chunk(s) completely and write nothing: every node rehashes to its own hash,
+    /// the checkpoint tree is complete (every child present, no extra nodes), every ledger's
+    /// replayed state root equals its stored account_hash, every added inner node's children
+    /// are present, every deleted node existed, every ledger's transactions and LedgerHash
+    /// recompute, and the final state tree is complete. No xrpld, no NuDB, no SQLite.
+    #[arg(long, default_value_t = false)]
+    verify_only: bool,
 
     /// Skip hash verification (faster, not recommended)
     #[arg(long, default_value_t = false)]
@@ -71,15 +80,25 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let key_path = args.dat.with_extension("key");
-    println!("Writing NuDB store: {} / {}", args.dat.display(), key_path.display());
+    if args.verify_only {
+        if args.skip_verify || args.dat.is_some() || args.ledger_db.is_some() || args.txdb.is_some() {
+            bail!("--verify-only writes nothing and always verifies: drop --dat, --ledger-db, --txdb and --skip-verify");
+        }
+        return verify_only(&args.chunk);
+    }
+    let Some(dat) = args.dat.clone() else {
+        bail!("--dat is required unless --verify-only");
+    };
+
+    let key_path = dat.with_extension("key");
+    println!("Writing NuDB store: {} / {}", dat.display(), key_path.display());
 
     // One sink for the whole invocation: every node any chunk produces is written to the
     // .dat file the moment replay produces it, then dropped. Sharing a single sink across
     // all --chunk files also gives cross-chunk dedup for free (a node duplicated in a later
     // chunk's checkpoint is written once), which is what the old
     // `all_state_nodes.entry().or_insert()` union used to do — without holding that union.
-    let mut sink = NuDbSink::create(&args.dat)?;
+    let mut sink = NuDbSink::create(&dat)?;
     let mut ledger_rows: Vec<LedgerDbRow> = Vec::new();
     let mut txdb: Option<TxDbSink> = match &args.txdb {
         Some(p) => Some(TxDbSink::create(p)?),
@@ -132,6 +151,111 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// `--verify-only`: run the full replay and every check, with a sink that writes nothing.
+fn verify_only(chunks: &[PathBuf]) -> Result<()> {
+    let mut sink = NullSink;
+    let mut no_txdb: Option<TxDbSink> = None;
+    let mut ledgers = 0usize;
+    for chunk_path in chunks {
+        println!("Verifying chunk: {}", chunk_path.display());
+        let replay = if detect_version(chunk_path)? == FORMAT_VERSION_STREAMED {
+            replay_chunk_streaming(chunk_path, true, &mut sink, &mut no_txdb)?
+        } else {
+            let data = fs::read(chunk_path)?;
+            let chunk = deserialize_chunk(&data).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Chunk hash OK: {}", hex::encode(chunk.chunk_hash));
+            replay_chunk(&chunk, true, &mut sink, &mut no_txdb)?
+        };
+        ledgers += replay.ledger_rows.len() + 1;
+        println!("VERIFIED {}: {} ledgers, final state {} nodes", chunk_path.display(), replay.ledger_rows.len() + 1, replay.state.len());
+    }
+    println!("Verify complete: {} chunk(s), {ledgers} ledgers, nothing written.", chunks.len());
+    Ok(())
+}
+
+/// Where replayed nodes go: the NuDB store on import, nowhere on --verify-only.
+trait NodeSink {
+    fn contains(&self, hash: &Hash256) -> bool;
+    fn write_node(&mut self, hash: Hash256, value: &[u8]) -> Result<()>;
+}
+
+impl NodeSink for NuDbSink {
+    fn contains(&self, hash: &Hash256) -> bool {
+        NuDbSink::contains(self, hash)
+    }
+    fn write_node(&mut self, hash: Hash256, value: &[u8]) -> Result<()> {
+        NuDbSink::write_node(self, hash, value)
+    }
+}
+
+/// Discards everything. `contains` returns true so nodes are not even encoded.
+struct NullSink;
+
+impl NodeSink for NullSink {
+    fn contains(&self, _hash: &Hash256) -> bool {
+        true
+    }
+    fn write_node(&mut self, _hash: Hash256, _value: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Walk the state tree from `root` and fail on the first child that is not in `state`. Returns
+/// the number of nodes reached. A SHAMap holds no node twice, so no visited set is needed.
+fn walk_complete(root: &Hash256, state: &HashMap<Hash256, Rc<SHAMapNode>>) -> Result<usize> {
+    let mut stack = vec![*root];
+    let mut reached = 0usize;
+    while let Some(h) = stack.pop() {
+        let node = state
+            .get(&h)
+            .ok_or_else(|| anyhow::anyhow!("node {} is referenced but missing", hex::encode(h)))?;
+        reached += 1;
+        if node.node_type.is_inner() {
+            let inner = InnerNode::from_node(node).map_err(|e| anyhow::anyhow!("{e}"))?;
+            stack.extend(inner.child_hashes().copied());
+        }
+    }
+    Ok(reached)
+}
+
+/// The tree under `root` is complete and `state` holds nothing else.
+fn check_tree_complete(what: &str, root: &Hash256, state: &HashMap<Hash256, Rc<SHAMapNode>>) -> Result<()> {
+    let reached = walk_complete(root, state).with_context(|| format!("{what}: state tree incomplete"))?;
+    if reached != state.len() {
+        bail!(
+            "{what}: {} nodes held but only {reached} reachable from root {}",
+            state.len(),
+            hex::encode(root)
+        );
+    }
+    println!("  {what}: state tree complete, {reached} nodes, none extra");
+    Ok(())
+}
+
+/// After applying a delta: each added inner node's children are present. `deleted` is the same
+/// delta's deletions, only used to say in the error whether the missing child was removed by it.
+fn check_added_children(
+    seq: u32,
+    added: &[SHAMapNode],
+    deleted: &[Hash256],
+    state: &HashMap<Hash256, Rc<SHAMapNode>>,
+) -> Result<()> {
+    for node in added.iter().filter(|n| n.node_type.is_inner()) {
+        let inner = InnerNode::from_node(node).map_err(|e| anyhow::anyhow!("{e}"))?;
+        for child in inner.child_hashes() {
+            if !state.contains_key(child) {
+                bail!(
+                    "ledger {seq}: added node {} points to child {} that is not present{}",
+                    hex::encode(node.hash),
+                    hex::encode(child),
+                    if deleted.contains(child) { " (it was removed by this same ledger's deletions)" } else { " (and this ledger did not delete it)" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// One row for xrpld's `Ledgers` table (`ledger.db`), matching `kLgrDbInit`
 /// (`include/xrpl/rdb/DBInit.h`) exactly.
 #[derive(Debug)]
@@ -175,7 +299,7 @@ struct ReplayResult {
 /// With `--txdb`: store the ledger header as the NuDB object xrpld looks up by LedgerHash, and
 /// write the ledger's transaction rows. A no-op without `--txdb`.
 fn write_ledger_outputs(
-    sink: &mut NuDbSink,
+    sink: &mut dyn NodeSink,
     txdb: &mut Option<TxDbSink>,
     tx_map: &TxMap,
     parent_hash: Hash256,
@@ -199,7 +323,7 @@ fn write_ledger_outputs(
     t.write_ledger(tx_map)
 }
 
-fn sink_node(sink: &mut NuDbSink, node: &SHAMapNode) -> Result<()> {
+fn sink_node(sink: &mut dyn NodeSink, node: &SHAMapNode) -> Result<()> {
     // Check before encoding: on a multi-chunk import every later chunk's checkpoint repeats
     // ~28M nodes the previous chunk already wrote, and encoding just to discard is wasted work.
     if sink.contains(&node.hash) {
@@ -216,7 +340,7 @@ fn sink_node(sink: &mut NuDbSink, node: &SHAMapNode) -> Result<()> {
 fn replay_chunk(
     chunk: &Chunk,
     verify: bool,
-    sink: &mut NuDbSink,
+    sink: &mut dyn NodeSink,
     txdb: &mut Option<TxDbSink>,
 ) -> Result<ReplayResult> {
     let mut state: HashMap<Hash256, Rc<SHAMapNode>> = chunk
@@ -241,6 +365,9 @@ fn replay_chunk(
             "checkpoint account_hash {} not found among checkpoint nodes",
             hex::encode(cp.account_hash)
         );
+    }
+    if verify {
+        check_tree_complete(&format!("ledger {} (checkpoint)", cp.ledger_seq), &cp.account_hash, &state)?;
     }
     if verify {
         verify_txns_authentic(cp)?;
@@ -275,12 +402,25 @@ fn replay_chunk(
     let mut ledger_rows = Vec::new();
 
     for (i, delta) in chunk.deltas.iter().enumerate() {
+        // New state = (old state - deleted) + added. Removal has to come first: the diff compares
+        // tree positions, not hashes, so a node that moves up a level is listed as both deleted
+        // and added, and it belongs in the new state.
+        if verify {
+            for hash in &delta.diff.deleted {
+                if !state.contains_key(hash) {
+                    bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
+                }
+            }
+        }
+        for hash in &delta.diff.deleted {
+            state.remove(hash);
+        }
         for node in &delta.diff.added {
             state.insert(node.hash, Rc::new(node.clone()));
             sink_node(sink, node)?;
         }
-        for hash in &delta.diff.deleted {
-            state.remove(hash);
+        if verify {
+            check_added_children(delta.ledger_seq, &delta.diff.added, &delta.diff.deleted, &state)?;
         }
 
         let tx_map = chunk
@@ -368,6 +508,9 @@ fn replay_chunk(
         prev_ledger_hash = tx_map.ledger_hash;
     }
 
+    if verify {
+        check_tree_complete("final ledger", &current_root, &state)?;
+    }
     Ok(ReplayResult { state, ledger_rows })
 }
 
@@ -390,7 +533,7 @@ fn detect_version(path: &std::path::Path) -> Result<u8> {
 fn replay_chunk_streaming(
     path: &std::path::Path,
     verify: bool,
-    sink: &mut NuDbSink,
+    sink: &mut dyn NodeSink,
     txdb: &mut Option<TxDbSink>,
 ) -> Result<ReplayResult> {
     let mut reader = ChunkReader::open(path)?;
@@ -438,6 +581,9 @@ fn replay_chunk_streaming(
         );
     }
     if verify {
+        check_tree_complete(&format!("ledger {} (checkpoint)", cp.ledger_seq), &cp.account_hash, &state)?;
+    }
+    if verify {
         verify_txns_authentic(&cp)?;
     }
     if let Some(t) = txdb.as_mut() {
@@ -463,12 +609,25 @@ fn replay_chunk_streaming(
     let mut ledger_rows = Vec::new();
 
     while let Some((delta, tx_map)) = reader.next_delta_tx_map()? {
+        // New state = (old state - deleted) + added. Removal has to come first: the diff compares
+        // tree positions, not hashes, so a node that moves up a level is listed as both deleted
+        // and added, and it belongs in the new state.
+        if verify {
+            for hash in &delta.diff.deleted {
+                if !state.contains_key(hash) {
+                    bail!("ledger {}: deleted node {} was not in the state", delta.ledger_seq, hex::encode(hash));
+                }
+            }
+        }
+        for hash in &delta.diff.deleted {
+            state.remove(hash);
+        }
         for node in &delta.diff.added {
             state.insert(node.hash, Rc::new(node.clone()));
             sink_node(sink, node)?;
         }
-        for hash in &delta.diff.deleted {
-            state.remove(hash);
+        if verify {
+            check_added_children(delta.ledger_seq, &delta.diff.added, &delta.diff.deleted, &state)?;
         }
 
         if tx_map.ledger_seq != delta.ledger_seq {
@@ -553,6 +712,9 @@ fn replay_chunk_streaming(
     }
 
     reader.finish()?;
+    if verify {
+        check_tree_complete("final ledger", &current_root, &state)?;
+    }
     Ok(ReplayResult { state, ledger_rows })
 }
 
@@ -695,8 +857,9 @@ mod tests {
     /// application, root-finding, tx tree rebuild, and parent_hash-chained LedgerHash
     /// verification. Unlike the unit tests for individual pieces (build_tx_tree,
     /// write_nudb_store), this catches "wired the fields in the wrong order" bugs.
-    #[test]
-    fn two_ledger_chunk_replays_and_verifies() {
+    /// The two-ledger chunk used by the replay tests: checkpoint (leaf A under root A), then one
+    /// ledger that replaces both with leaf B under root B.
+    fn two_ledger_fixture() -> Chunk {
         let leaf_a = leaf(0xAA);
         let root_a = inner_with_child(3, leaf_a.hash);
 
@@ -775,6 +938,15 @@ mod tests {
             tx_maps: vec![tx_map_a, tx_map_b],
         };
 
+        chunk
+    }
+
+    #[test]
+    fn two_ledger_chunk_replays_and_verifies() {
+        let chunk = two_ledger_fixture();
+        let leaf_a = leaf(0xAA);
+        let leaf_b = leaf(0xBB);
+        let root_b = inner_with_child(3, leaf_b.hash);
         let (mut sink, sink_dir) = temp_sink("two_ledger");
         let replay = replay_chunk(&chunk, true, &mut sink, &mut None).expect("replay + verify should succeed");
         assert_eq!(replay.state.len(), 2, "final live state should be exactly ledger B's nodes");
@@ -793,6 +965,38 @@ mod tests {
         );
         fs::remove_dir_all(&sink_dir).ok();
         fs::remove_dir_all(&bad_sink_dir).ok();
+    }
+
+    /// The new --verify-only checks: a missing child, an extra node, and a deleted node that was
+    /// never in the state must each fail, and the same chunk verifies with a sink that writes nothing.
+    #[test]
+    fn completeness_checks_catch_missing_extra_and_bad_deletes() {
+        let ok = two_ledger_fixture();
+        replay_chunk(&ok, true, &mut NullSink, &mut None).expect("clean chunk verifies with NullSink");
+
+        // Checkpoint missing leaf A: root A points to a child that is not there.
+        let mut missing = two_ledger_fixture();
+        missing.checkpoint.retain(|n| n.hash != leaf(0xAA).hash);
+        let err = replay_chunk(&missing, true, &mut NullSink, &mut None).unwrap_err();
+        assert!(format!("{err:#}").contains("missing"), "got: {err:#}");
+
+        // Checkpoint with an extra node no root reaches.
+        let mut extra = two_ledger_fixture();
+        extra.checkpoint.push(leaf(0xCC));
+        let err = replay_chunk(&extra, true, &mut NullSink, &mut None).unwrap_err();
+        assert!(format!("{err:#}").contains("reachable"), "got: {err:#}");
+
+        // A delta deleting a node that was never in the state.
+        let mut bad_delete = two_ledger_fixture();
+        bad_delete.deltas[0].diff.deleted.push(leaf(0xDD).hash);
+        let err = replay_chunk(&bad_delete, true, &mut NullSink, &mut None).unwrap_err();
+        assert!(format!("{err:#}").contains("was not in the state"), "got: {err:#}");
+
+        // A delta whose new root points to a child that was never added.
+        let mut dangling = two_ledger_fixture();
+        dangling.deltas[0].diff.added.retain(|n| n.hash != leaf(0xBB).hash);
+        let err = replay_chunk(&dangling, true, &mut NullSink, &mut None).unwrap_err();
+        assert!(format!("{err:#}").contains("not present"), "got: {err:#}");
     }
 
     /// The same two-ledger chunk as above, but written to a real v3 file via `ChunkWriter`
